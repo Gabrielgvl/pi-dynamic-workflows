@@ -554,6 +554,39 @@ return await agent('task', { agentType: 'reviewer' })`;
   }
 });
 
+test("atomic child replay invalidates when any model alias target changes", async () => {
+  const childScript = `export const meta = { name: 'child', description: 'child' }\nreturn await agent('task', { model: 'haiku' })`;
+  const script = parentScript(`return await workflow('child')`);
+  const journal: JournalEntry[] = [];
+  let calls = 0;
+  const runner = {
+    async run() {
+      calls++;
+      return `result-${calls}`;
+    },
+  };
+
+  const first = await runWorkflow<string>(script, {
+    loadSavedWorkflow: () => childScript,
+    modelAliases: { haiku: "mock/one", sonnet: "mock/sonnet" },
+    persistLogs: false,
+    onAgentJournal: (entry) => journal.push(entry),
+    agent: runner,
+  });
+  assert.equal(first.result, "result-1");
+
+  const replay = await runWorkflow<string>(script, {
+    loadSavedWorkflow: () => childScript,
+    modelAliases: { haiku: "mock/two", sonnet: "mock/sonnet" },
+    persistLogs: false,
+    resumeJournal: new Map(journal.map((entry) => [entry.index, entry])),
+    agent: runner,
+  });
+
+  assert.equal(replay.result, "result-2");
+  assert.equal(calls, 2, "changing the child-used alias must rerun the atomic child");
+});
+
 test("atomic child replay invalidates when an effective agent definition changes", async () => {
   const childScript = `export const meta = { name: 'child', description: 'child' }
 return await agent('task', { agentType: 'reviewer' })`;

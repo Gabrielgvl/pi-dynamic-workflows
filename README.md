@@ -99,6 +99,7 @@ The same model — on Pi, plus the production pieces a real run needs:
 ```text
 /workflows                  open the interactive navigator (plain list in print mode)
 /workflows status <id>      watch a run live; print its result when it finishes
+/workflows report <id>      print persistent per-agent model/context/tool/usage telemetry
 /workflows save <name>      save the latest run's script as a reusable /<name> command
 /workflows pause|resume|stop|rm <id>
 /workflows-trigger off|on|status
@@ -168,6 +169,22 @@ Workflow state is stored under `~/.pi/workflows` so projects do not accumulate e
 
 Use `/workflows-models` to edit these in the TUI: choose the base model first, then choose `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or the session default.
 
+Workflow settings can also route exact symbolic model names before normal Pi model parsing/fuzzy matching. Alias keys are case-insensitive; project settings use the same shape and shallowly override the global file. Set `strictModelResolution` to reject an unavailable requested or alias-target model with `SCRIPT_VALIDATION_ERROR` instead of falling back to the session default:
+
+```json
+{
+  "modelAliases": {
+    "haiku": "openai-codex/gpt-5.6-luna",
+    "sonnet": "openai-codex/gpt-5.6-terra",
+    "opus": "openai-codex/gpt-5.6-sol",
+    "fable": "openai-codex/gpt-5.6-sol"
+  },
+  "strictModelResolution": true
+}
+```
+
+Concrete `provider/model` values and non-aliased specs keep their existing behavior. Alias targets participate in resume identity, so changing a target forces affected resumed work to run live rather than replaying a stale journal result. The project override lives at `~/.pi/workflows/projects/<project-key>/settings.json` and wins using the existing shallow merge semantics.
+
 To avoid accidental keyword triggers, configure a custom trigger word in `~/.pi/workflows/settings.json`:
 
 ```json
@@ -200,17 +217,23 @@ The top-level `workflow` tool accepts exactly one of `script` (raw source) or `s
 | `tier` | `"small"` \| `"medium"` \| `"big"` — coarse model routing (configure via `/workflows-models`; tiers may store `provider/modelId:thinking`). |
 | `model` | Exact `provider/modelId` or `provider/modelId:thinking` (always wins over `tier`). |
 | `effort` | Explicit Pi thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. It wins over a model suffix and inherited session thinking. |
-| `agentType` | A named definition (`.pi/agents/<name>.md` project-level, or `~/.pi/agent/agents/<name>.md` user-level — `~/.pi/agents/<name>.md` still works as a deprecated fallback) binding tools + model + role prompt. |
+| `agentType` | A named definition (`.pi/agents/<name>.md` project-level, or `~/.pi/agent/agents/<name>.md` user-level — `~/.pi/agents/<name>.md` still works as a deprecated fallback) binding tools + model + role prompt. Literal boolean frontmatter `skills: false` disables SDK skill loading for that subagent only; absent/`true` keeps normal loading. |
 | `isolation: "worktree"` | Run in a throwaway git worktree for conflict-free parallel edits. |
 | `schema` | TypeBox or a plain JSON Schema → the subagent returns a validated object. Literal schemas support the tested TypeBox-compatible subset: scalar types, objects (`properties`/`required`), and homogeneous arrays (`items`). |
 | `label` / `phase` / `timeoutMs` | Display label / phase override / optional per-agent hard timeout. Omit `timeoutMs` for no hard timeout. |
 | `retries` | Retry attempts after a recoverable failure (timeout, connection failure, empty output) for this agent. Overrides the run-level `agentRetries`. Default `0`. |
 
-Nested `workflow()` calls remain limited to one level. A `{ scriptPath }` is resolved from the workflow cwd; relative paths and absolute paths inside that realpath root are allowed, while traversal, symlink escapes, missing paths, and directories are rejected. Child args must be deterministic JSON-serializable values (no `undefined`, functions, symbols, bigint, non-finite numbers, or cycles). A successful child is one atomic parent journal entry containing its result, shared-store delta, and logical child-agent count. Resume skips an unchanged child; changing its source or args reruns it entirely, and interrupted children leave no partial parent entry.
+Nested `workflow()` calls remain limited to one level. A `{ scriptPath }` is resolved from the workflow cwd; relative paths and absolute paths inside that realpath root are allowed, while traversal, symlink escapes, missing paths, and directories are rejected. Child args must be deterministic JSON-serializable values (no `undefined`, functions, symbols, bigint, non-finite numbers, or cycles). A successful child is one atomic parent journal entry containing its result, shared-store delta, and logical child-agent count. Resume skips an unchanged child; changing its source or args reruns it entirely, and interrupted children leave no partial parent entry. Because the parent cannot know which aliases the child uses without executing it, any normalized model-alias map change reruns the atomic child; direct `agent()` resume hashes remain selective to the alias requested by that call.
 
 Unknown explicit `agentType` names keep the existing fallback behavior by default. Set `agentTypePolicy: "error"` in `runWorkflow` or `WorkflowManager` options to reject an unknown explicit name before creating a runner session; registered and untyped agents are unaffected. `WorkflowManager.resume(runId, argsPatch?)` optionally performs a safe shallow plain-object merge where supplied keys win and persists the merged args before execution. Arrays, null, non-objects, prototype keys, and incompatible persisted args are rejected; omitting `argsPatch` preserves the existing resume behavior.
 
+Agent definitions honor only literal YAML booleans for `skills`; quoted strings such as `skills: "false"` are ignored. With `skills: false`, Pi reloads the normal resource loader with `noSkills: true`, retaining extensions (including context-mode), project context, prompt templates, themes, settings, model registration, and custom tools. An explicitly injected SDK `session.resourceLoader` cannot be safely replaced, so that combination fails clearly instead of claiming skills were disabled.
+
+`/workflows report <runId>` reads the persisted run JSON and shows requested alias → concrete model, effective thinking, live/replay state, skills, tools, system/context sizes, and the provider-reported `AgentUsage` breakdown and cost for every agent. Legacy runs remain readable and show telemetry as unavailable; replayed agents are explicitly labeled and only reuse telemetry that was actually journaled.
+
 By default, workflows do not set a run-wide token budget or per-agent hard timeout. Use the `workflow` tool's `tokenBudget` / `agentTimeoutMs`, per-phase budgets, or per-agent `timeoutMs` only when you want an explicit cap. A global fallback timeout can also be set in `~/.pi/workflows/settings.json` as `{ "defaultAgentTimeoutMs": 600000 }`; set it to `null` or omit it for no default hard timeout.
+
+Token telemetry is copied directly from Pi/provider session statistics; it is not estimated. Provider `total` values are preserved as reported and may not equal a naive sum of the displayed input/output/cache fields. The report's cache ratio is `cacheRead / (input + cacheRead)` and displays `n/a` when that denominator is zero. Existing token-budget gating retains its backward-compatible estimated fallback only when a provider reports no total; that estimate is never written into per-agent telemetry.
 
 For larger or flakier fan-outs, the `workflow` tool also accepts `concurrency` (max agents running at once, clamped to the runtime maximum of `16`) and `agentRetries` (retry attempts after a recoverable agent failure such as a timeout, connection failure, or empty output). Both can be defaulted in `~/.pi/workflows/settings.json` as `{ "defaultConcurrency": 4, "defaultAgentRetries": 2 }`; a per-run tool value overrides the default, and a per-agent `retries` overrides `agentRetries`. Retries default to `0` (off) unless configured or passed, and only recoverable failures retry — nonrecoverable errors still abort the run.
 

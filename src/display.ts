@@ -1,4 +1,5 @@
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { AgentTelemetry } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import type { WorkflowErrorCode } from "./errors.js";
 import type { WorkflowMeta } from "./workflow.js";
@@ -20,6 +21,8 @@ export interface WorkflowAgentSnapshot {
   tokens?: number;
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
+  /** Exact live telemetry, or persisted telemetry explicitly marked as replayed. */
+  telemetry?: AgentTelemetry;
 }
 
 export interface WorkflowSnapshot {

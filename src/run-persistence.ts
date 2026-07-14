@@ -4,6 +4,7 @@
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { AgentTelemetry } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import type { WorkflowErrorCode } from "./errors.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
@@ -25,6 +26,7 @@ export interface PersistedAgentState {
   endedAt?: string;
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
+  telemetry?: AgentTelemetry;
 }
 
 export interface PersistedRunState {
@@ -66,6 +68,7 @@ export interface PersistedRunState {
     result: unknown;
     storeDelta?: Record<string, unknown>;
     storeVersions?: Record<string, number>;
+    telemetry?: AgentTelemetry;
     agentCount?: number;
     resultKind?: "void";
   }>;

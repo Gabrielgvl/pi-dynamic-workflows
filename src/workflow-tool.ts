@@ -160,6 +160,8 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       loadSavedWorkflow: (name: string) => storage.load(name)?.script,
       defaultAgentTimeoutMs: defaults.agentTimeoutMs,
       defaultAgentRetries: defaults.agentRetries,
+      modelAliases: defaults.modelAliases,
+      strictModelResolution: defaults.strictModelResolution,
     });
 
   return defineTool({
@@ -352,7 +354,13 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
 function resolveWorkflowToolDefaults(
   options: WorkflowToolOptions,
   cwd: string,
-): { agentTimeoutMs: number | null; concurrency?: number; agentRetries: number } {
+): {
+  agentTimeoutMs: number | null;
+  concurrency?: number;
+  agentRetries: number;
+  modelAliases?: Record<string, string>;
+  strictModelResolution?: boolean;
+} {
   const settings = loadWorkflowSettings({ cwd });
   return {
     agentTimeoutMs:
@@ -361,6 +369,8 @@ function resolveWorkflowToolDefaults(
         : (settings.defaultAgentTimeoutMs ?? null),
     concurrency: options.defaultConcurrency ?? options.concurrency ?? settings.defaultConcurrency,
     agentRetries: options.defaultAgentRetries ?? settings.defaultAgentRetries ?? 0,
+    modelAliases: settings.modelAliases,
+    strictModelResolution: settings.strictModelResolution,
   };
 }
 

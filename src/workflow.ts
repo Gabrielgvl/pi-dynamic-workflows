@@ -4,7 +4,7 @@ import { isAbsolute, relative, resolve } from "node:path";
 import vm from "node:vm";
 import type { Node } from "acorn";
 import { parse } from "acorn";
-import type { AgentUsage } from "./agent.js";
+import type { AgentTelemetry, AgentUsage } from "./agent.js";
 import { WorkflowAgent, type WorkflowAgentOptions } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import {
@@ -64,6 +64,8 @@ export interface JournalEntry {
   storeDelta?: Record<string, unknown>;
   /** Monotonic execution-time version for each storeDelta key. */
   storeVersions?: Record<string, number>;
+  /** Exact telemetry captured when this entry last ran live. */
+  telemetry?: AgentTelemetry;
   /** Logical child agents represented by an atomic workflow() entry. */
   agentCount?: number;
   /** Explicit encoding for an atomic child that completed with no return value. */
@@ -147,6 +149,7 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     error?: string;
     errorCode?: WorkflowErrorCode;
     recoverable?: boolean;
+    telemetry?: AgentTelemetry;
   }) => void;
   onAgentHistory?: (event: { label: string; phase?: string; history: AgentHistoryEntry[] }) => void;
   onTokenUsage?: (usage: {
@@ -330,6 +333,10 @@ export async function runWorkflow<T = unknown>(
   const { meta, body } = parseWorkflowScript(script);
   // Per-phase model routing from meta.phases[].model, with meta.model as the default.
   const routingConfig = parseModelRoutingFromMeta(meta.phases, meta.model);
+  // Snapshot effective settings once so external mutation cannot change routing
+  // between agents while leaving their deterministic call hashes unchanged.
+  const modelAliases = options.modelAliases ? { ...options.modelAliases } : undefined;
+  const strictModelResolution = options.strictModelResolution ?? false;
   const maxAgents = options.maxAgents ?? MAX_AGENTS_PER_RUN;
   const agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
   const runId = options.runId ?? `run-${started.toString(36)}`;
@@ -367,7 +374,7 @@ export async function runWorkflow<T = unknown>(
     firstMiss: Number.POSITIVE_INFINITY,
   };
 
-  const agentRunner = options.agent ?? new WorkflowAgent(options);
+  const agentRunner = options.agent ?? new WorkflowAgent({ ...options, modelAliases, strictModelResolution });
   const concurrency = normalizeConcurrency(
     options.concurrency ?? Math.max(1, (globalThis.navigator?.hardwareConcurrency ?? 8) - 2),
   );
@@ -501,7 +508,14 @@ export async function runWorkflow<T = unknown>(
     // Deterministic resume key: assigned at lexical call time, before the limiter,
     // so parallel()/pipeline() fan-out is reproducible for a fixed script.
     const callIndex = state.callSeq++;
-    const callHash = hashAgentCall(prompt, modelSpec, assignedPhase, agentOptions, agentDefinitionKey(agentDef));
+    const callHash = hashAgentCall(
+      prompt,
+      modelSpec,
+      assignedPhase,
+      agentOptions,
+      agentDefinitionKey(agentDef),
+      modelResolutionIdentity(modelSpec, modelAliases, strictModelResolution),
+    );
     // Store delta key: callIndex alone is NOT run-unique. A nested workflow()
     // call (see workflowFn below) shares this run's SharedStore instance but
     // restarts its own callSeq at 0, so a parent agent and a concurrently
@@ -530,8 +544,19 @@ export async function runWorkflow<T = unknown>(
     const hashMatches = cached != null && cached.hash === callHash;
     const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
     if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
+      const replayTelemetry: AgentTelemetry = cached.telemetry
+        ? { ...cached.telemetry, execution: "replay" }
+        : { execution: "replay", requestedModelSpec: modelSpec };
+      displayModel = replayTelemetry.resolvedModel ?? displayModel;
       options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
-      options.onAgentEnd?.({ label, phase: assignedPhase, result: cached.result, tokens: 0, model: displayModel });
+      options.onAgentEnd?.({
+        label,
+        phase: assignedPhase,
+        result: cached.result,
+        tokens: 0,
+        model: displayModel,
+        telemetry: replayTelemetry,
+      });
       // Captured write versions preserve live execution order even though replay
       // visits calls in lexical call-index order.
       if (cached.storeDelta) store.applyDelta(cached.storeDelta, cached.storeVersions);
@@ -561,11 +586,11 @@ export async function runWorkflow<T = unknown>(
       }
       const runCwd = worktree?.isolated ? worktree.cwd : undefined;
 
-      // Captured from the subagent's real session usage; falls back to an
-      // estimate when the provider reports no usage (total === 0). Usage is reset
-      // per retry attempt so a failed attempt does not double-count the next one.
-      let usage: AgentUsage | undefined;
-      const recordTokens = (result: unknown): number => {
+      // Aggregate only finalized attempt-local telemetry. A timed-out runner can
+      // keep invoking callbacks after retry starts, so callbacks must never write
+      // directly into state shared by attempts.
+      let telemetry: AgentTelemetry | undefined;
+      const recordTokens = (result: unknown, usage: AgentUsage | undefined): number => {
         const tokens = usage && usage.total > 0 ? usage.total : estimateTokens(result) + estimateTokens(prompt);
         if (usage) {
           shared.tokenUsage.input += usage.input;
@@ -581,50 +606,78 @@ export async function runWorkflow<T = unknown>(
 
       try {
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-          usage = undefined;
           const attemptDeltaKey = `${deltaKey}:attempt${attempt}`;
           const attemptController = new AbortController();
           const attemptSignal = combineAbortSignals(options.signal, attemptController.signal);
+          let callbacksOpen = true;
+          let attemptDisplayModel = displayModel;
+          let attemptUsage: AgentUsage | undefined;
+          let attemptTelemetry: AgentTelemetry | undefined;
+          let accountedUsage: AgentUsage | undefined;
+          const finalizeAttempt = (settled: boolean) => {
+            callbacksOpen = false;
+            if (settled) displayModel = attemptDisplayModel;
+            accountedUsage = attemptUsage ?? attemptTelemetry?.usage;
+            if (!attemptTelemetry && !accountedUsage && settled) return;
+            const finalized: AgentTelemetry = {
+              ...(attemptTelemetry ?? { execution: "live", requestedModelSpec: modelSpec }),
+              usage: accountedUsage ? { ...accountedUsage } : undefined,
+              accountingStatus: settled && accountedUsage ? "exact" : "incomplete",
+              accountingIncompleteAttempts: settled ? undefined : 1,
+            };
+            telemetry = mergeAgentTelemetry(telemetry, finalized);
+          };
           try {
             throwIfAborted();
 
             // Each retry has its own cancellation signal and store scope. A timed-out
             // runner may ignore cancellation, but its closed tools cannot contaminate
             // a later attempt.
-            const result = await withTimeout(
-              agentRunner.run(prompt, {
-                label,
-                // Identifiable name for persisted sessions (persistAgentSessions).
-                sessionName: `workflow:${runId} ${label}`,
-                schema: agentOptions.schema,
-                signal: attemptSignal,
-                instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef, resolvedIsolation),
-                model: modelSpec,
-                tier: agentOptions.tier,
-                effort: agentOptions.effort,
-                modelRegistry: options.modelRegistry,
-                toolNames: agentDef?.tools,
-                disallowedToolNames: agentDef?.disallowedTools,
-                systemTools: createAgentStoreTools(store, attemptDeltaKey),
-                cwd: runCwd,
-                onModelResolved: (id: string) => {
-                  displayModel = id;
-                },
-                onModelFallback: (spec: string) => {
-                  // Make the silent degrade visible in /workflows, not just console.
-                  log(`${label}: model "${spec}" unavailable — using the session default`);
-                },
-                onUsage: (u: AgentUsage) => {
-                  usage = u;
-                },
-                onHistory: (history: AgentHistoryEntry[]) => {
-                  options.onAgentHistory?.({ label, phase: assignedPhase, history });
-                },
-              }),
-              timeout,
+            const runnerPromise = agentRunner.run(prompt, {
               label,
-              () => attemptController.abort(),
-            );
+              // Identifiable name for persisted sessions (persistAgentSessions).
+              sessionName: `workflow:${runId} ${label}`,
+              schema: agentOptions.schema,
+              signal: attemptSignal,
+              instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef, resolvedIsolation),
+              model: modelSpec,
+              tier: agentOptions.tier,
+              effort: agentOptions.effort,
+              modelRegistry: options.modelRegistry,
+              modelAliases,
+              strictModelResolution,
+              skills: agentDef?.skills,
+              toolNames: agentDef?.tools,
+              disallowedToolNames: agentDef?.disallowedTools,
+              systemTools: createAgentStoreTools(store, attemptDeltaKey),
+              cwd: runCwd,
+              onModelResolved: (id: string) => {
+                if (callbacksOpen) attemptDisplayModel = id;
+              },
+              onModelFallback: (spec: string) => {
+                // Make the silent degrade visible in /workflows, not just console.
+                if (callbacksOpen) log(`${label}: model "${spec}" unavailable — using the session default`);
+              },
+              onUsage: (usage: AgentUsage) => {
+                if (callbacksOpen) attemptUsage = { ...usage };
+              },
+              onTelemetry: (value: AgentTelemetry) => {
+                if (callbacksOpen) attemptTelemetry = mergeAgentTelemetry(attemptTelemetry, value);
+              },
+              onHistory: (history: AgentHistoryEntry[]) => {
+                if (callbacksOpen) options.onAgentHistory?.({ label, phase: assignedPhase, history });
+              },
+            });
+            let result: unknown;
+            try {
+              result = await withTimeout(runnerPromise, timeout, label, () => attemptController.abort());
+            } catch (error) {
+              attemptController.abort();
+              const settled = await waitForRunnerSettlement(runnerPromise, RUNNER_CLEANUP_GRACE_MS);
+              finalizeAttempt(settled);
+              throw error;
+            }
+            finalizeAttempt(true);
 
             throwIfAborted();
             if (isEmptyTextAgentResult(result, agentOptions.schema)) {
@@ -634,7 +687,7 @@ export async function runWorkflow<T = unknown>(
               });
             }
 
-            const tokens = recordTokens(result);
+            const tokens = recordTokens(result, accountedUsage);
             const preparedDelta = store.prepareDelta(attemptDeltaKey);
             options.onAgentJournal?.({
               index: callIndex,
@@ -642,6 +695,7 @@ export async function runWorkflow<T = unknown>(
               result,
               storeDelta: preparedDelta.values,
               storeVersions: preparedDelta.versions,
+              telemetry,
             });
             store.commitDelta(attemptDeltaKey);
             options.onAgentEnd?.({
@@ -651,6 +705,7 @@ export async function runWorkflow<T = unknown>(
               tokens,
               worktree: runCwd,
               model: displayModel,
+              telemetry,
             });
             return result;
           } catch (error) {
@@ -662,7 +717,7 @@ export async function runWorkflow<T = unknown>(
 
             const workflowError = wrapError(error, { agentLabel: label });
             logger.error(`agent ${label} attempt ${attempt}/${maxAttempts} failed: ${workflowError.message}`);
-            const tokens = recordTokens(null);
+            const tokens = recordTokens(null, accountedUsage);
 
             if (workflowError.recoverable && attempt < maxAttempts) {
               log(
@@ -681,6 +736,7 @@ export async function runWorkflow<T = unknown>(
               error: workflowError.message,
               errorCode: workflowError.code,
               recoverable: workflowError.recoverable,
+              telemetry,
             });
 
             if (workflowError.recoverable) {
@@ -787,6 +843,8 @@ export async function runWorkflow<T = unknown>(
       childArgs,
       agentRegistrySnapshotKey(agentRegistry),
       agentTypePolicy,
+      modelResolutionIdentity(undefined, undefined, strictModelResolution),
+      modelAliasesIdentity(modelAliases),
     );
     const cached = options.resumeJournal?.get(callIndex);
     const hashMatches = cached != null && cached.hash === callHash;
@@ -828,6 +886,8 @@ export async function runWorkflow<T = unknown>(
       const child = await runWorkflow(resolved.script, {
         ...options,
         args: childArgsSupplied ? childArgs : undefined,
+        modelAliases,
+        strictModelResolution,
         agentRegistry,
         sharedRuntime: shared,
         // Child writes remain in an overlay until the entire invocation succeeds.
@@ -1342,6 +1402,24 @@ function isPathInside(root: string, candidate: string): boolean {
   );
 }
 
+function modelResolutionIdentity(
+  requestedModel: string | undefined,
+  aliases: Record<string, string> | undefined,
+  strict: boolean,
+): string {
+  const requestedKey = requestedModel?.trim().toLowerCase();
+  const aliasTarget = requestedKey
+    ? Object.entries(aliases ?? {})
+        .find(([alias, target]) => alias.trim().toLowerCase() === requestedKey && target.trim())?.[1]
+        .trim()
+    : undefined;
+  return JSON.stringify({
+    requestedModel: requestedModel ?? null,
+    aliasTarget: aliasTarget ?? null,
+    strict,
+  });
+}
+
 function hashWorkflowCall(
   identity: string,
   script: string,
@@ -1349,6 +1427,8 @@ function hashWorkflowCall(
   args: unknown,
   agentRegistryKey: string,
   agentTypePolicy: AgentTypePolicy,
+  modelResolution: string,
+  modelAliases: string,
 ): string {
   return createHash("sha256")
     .update(
@@ -1359,9 +1439,25 @@ function hashWorkflowCall(
         args: argsSupplied ? args : null,
         agentRegistry: agentRegistryKey,
         agentTypePolicy,
+        modelResolution,
+        // The parent cannot know which aliases the child uses without executing it,
+        // so any normalized alias-map change invalidates this atomic child. Direct
+        // agent() calls still hash only their requested alias target above.
+        modelAliases,
       }),
     )
     .digest("hex");
+}
+
+/** Stable identity for the complete alias map used by nested workflow() calls. */
+function modelAliasesIdentity(aliases: Record<string, string> | undefined): string {
+  const normalized = Object.entries(aliases ?? {}).reduce<Record<string, string>>((result, [key, target]) => {
+    const normalizedKey = key.trim().toLowerCase();
+    const normalizedTarget = target.trim();
+    if (normalizedKey && normalizedTarget) result[normalizedKey] = normalizedTarget;
+    return result;
+  }, {});
+  return JSON.stringify(Object.entries(normalized).sort(([left], [right]) => left.localeCompare(right)));
 }
 
 function agentRegistrySnapshotKey(registry: AgentRegistry): string {
@@ -1396,6 +1492,7 @@ function hashAgentCall(
   phase: string | undefined,
   options: AgentOptions,
   agentDefKey: string | null,
+  modelResolution: string,
 ): string {
   const identity = JSON.stringify({
     prompt,
@@ -1408,6 +1505,7 @@ function hashAgentCall(
     // this call's cached result on a later resume.
     agentDef: agentDefKey,
     schema: options.schema ?? null,
+    modelResolution,
   });
   return createHash("sha256").update(identity).digest("hex");
 }
@@ -1435,6 +1533,41 @@ function isEmptyTextAgentResult(result: unknown, schema: WorkflowSchema | undefi
   return schema === undefined && typeof result === "string" && result.trim().length === 0;
 }
 
+function mergeAgentTelemetry(current: AgentTelemetry | undefined, next: AgentTelemetry): AgentTelemetry {
+  if (!current) {
+    return {
+      ...next,
+      activeToolNames: next.activeToolNames ? [...next.activeToolNames] : undefined,
+      usage: next.usage ? { ...next.usage } : undefined,
+    };
+  }
+  const usage =
+    current.usage && next.usage
+      ? {
+          input: current.usage.input + next.usage.input,
+          output: current.usage.output + next.usage.output,
+          cacheRead: current.usage.cacheRead + next.usage.cacheRead,
+          cacheWrite: current.usage.cacheWrite + next.usage.cacheWrite,
+          total: current.usage.total + next.usage.total,
+          cost: current.usage.cost + next.usage.cost,
+        }
+      : (next.usage ?? current.usage);
+  const accountingIncompleteAttempts =
+    (current.accountingIncompleteAttempts ?? 0) + (next.accountingIncompleteAttempts ?? 0);
+  const accountingStatus =
+    current.accountingStatus === "incomplete" || next.accountingStatus === "incomplete"
+      ? "incomplete"
+      : (next.accountingStatus ?? current.accountingStatus);
+  return {
+    ...current,
+    ...next,
+    activeToolNames: next.activeToolNames ? [...next.activeToolNames] : current.activeToolNames,
+    usage: usage ? { ...usage } : undefined,
+    accountingStatus,
+    accountingIncompleteAttempts: accountingIncompleteAttempts || undefined,
+  };
+}
+
 function estimateTokens(value: unknown): number {
   return Math.ceil(JSON.stringify(value ?? "").length / 4);
 }
@@ -1454,6 +1587,28 @@ function normalizeAgentRetries(value: unknown): number {
  */
 function combineAbortSignals(parent: AbortSignal | undefined, attempt: AbortSignal): AbortSignal {
   return parent ? AbortSignal.any([parent, attempt]) : attempt;
+}
+
+// Give an aborted SDK session a short chance to finish its finally/dispose path
+// and publish exact usage before retrying. An injected runner may ignore abort,
+// so this wait is deliberately bounded and incomplete accounting is persisted.
+const RUNNER_CLEANUP_GRACE_MS = 50;
+
+async function waitForRunnerSettlement(promise: Promise<unknown>, graceMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let finished = false;
+    const finish = (settled: boolean) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timeoutId);
+      resolve(settled);
+    };
+    const timeoutId = setTimeout(() => finish(false), graceMs);
+    void promise.then(
+      () => finish(true),
+      () => finish(true),
+    );
+  });
 }
 
 async function withTimeout<T>(

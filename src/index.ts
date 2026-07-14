@@ -1,7 +1,22 @@
 export type { AdversarialReviewConfig } from "./adversarial-review.js";
 export { generateAdversarialReviewWorkflow, generateMultiPerspectiveWorkflow } from "./adversarial-review.js";
-export type { AgentRunOptions, AgentRunResult, WorkflowAgentOptions } from "./agent.js";
-export { listAvailableModelSpecs, resolveAgentThinkingLevel, WorkflowAgent } from "./agent.js";
+export type {
+  AgentRunOptions,
+  AgentRunResult,
+  AgentTelemetry,
+  AgentUsage,
+  WorkflowAgentOptions,
+  WorkflowResourceLoaderFactory,
+  WorkflowResourceLoaderOptions,
+  WorkflowSessionFactory,
+} from "./agent.js";
+export {
+  listAvailableModelSpecs,
+  resolveAgentModelSpec,
+  resolveAgentThinkingLevel,
+  resolveModelAlias,
+  WorkflowAgent,
+} from "./agent.js";
 export type { AgentHistoryEntry, AgentHistoryKind, AgentHistoryRole } from "./agent-history.js";
 export { compactAgentHistory } from "./agent-history.js";
 export type { AgentDefinition, AgentRegistry } from "./agent-registry.js";
@@ -123,6 +138,7 @@ export {
   workflowProjectPaths,
   workflowUserSavedDir,
 } from "./workflow-paths.js";
+export { formatWorkflowReport } from "./workflow-report.js";
 export type { SavedWorkflow, WorkflowStorage } from "./workflow-saved.js";
 export { assertSafeSavedWorkflowName, createWorkflowStorage, isSafeSavedWorkflowName } from "./workflow-saved.js";
 export type { WorkflowSettings, WorkflowSettingsOptions, WorkflowSettingsStore } from "./workflow-settings.js";

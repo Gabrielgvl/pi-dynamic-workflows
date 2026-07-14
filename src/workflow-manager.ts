@@ -102,6 +102,10 @@ export interface WorkflowManagerOptions {
    * standard sessions directory. Default false (in-memory, discarded).
    */
   persistAgentSessions?: boolean;
+  /** Exact, case-insensitive symbolic model aliases from effective workflow settings. */
+  modelAliases?: Record<string, string>;
+  /** Reject unresolved requested model specs. */
+  strictModelResolution?: boolean;
 }
 
 const UNSAFE_MERGE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
@@ -139,6 +143,8 @@ export class WorkflowManager extends EventEmitter {
   private defaultAgentRetries: number;
   private agentTypePolicy: AgentTypePolicy;
   private persistAgentSessions: boolean;
+  private modelAliases?: Record<string, string>;
+  private strictModelResolution: boolean;
 
   constructor(options: WorkflowManagerOptions = {}) {
     super();
@@ -153,6 +159,8 @@ export class WorkflowManager extends EventEmitter {
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
     this.agentTypePolicy = options.agentTypePolicy ?? "fallback";
     this.persistAgentSessions = options.persistAgentSessions ?? false;
+    this.modelAliases = options.modelAliases ? { ...options.modelAliases } : undefined;
+    this.strictModelResolution = options.strictModelResolution ?? false;
     this.persistence = createRunPersistence(this.cwd);
     this.recoverStaleRuns();
   }
@@ -375,6 +383,8 @@ export class WorkflowManager extends EventEmitter {
         mainModel: this.mainModel,
         modelRegistry: this.modelRegistry,
         persistAgentSessions: this.persistAgentSessions,
+        modelAliases: this.modelAliases,
+        strictModelResolution: this.strictModelResolution,
         signal: managed.controller.signal,
         concurrency: resolvedConcurrency,
         agentRetries: resolvedAgentRetries,
@@ -428,6 +438,7 @@ export class WorkflowManager extends EventEmitter {
             agent.errorCode = event.errorCode;
             agent.recoverable = event.recoverable;
             agent.tokens = event.tokens;
+            agent.telemetry = event.telemetry;
             if (event.model) agent.model = event.model;
           }
           this.emit("agentEnd", { runId: managed.runId, ...event });
@@ -699,6 +710,11 @@ export class WorkflowManager extends EventEmitter {
   /** All persisted runs regardless of session (used by cross-session recovery). */
   listAllRuns(): PersistedRunState[] {
     return this.persistence.list();
+  }
+
+  /** Resolve an explicit report ID without applying navigator session filtering. */
+  getRunForReport(runId: string): PersistedRunState | null {
+    return this.persistence.load(runId);
   }
 
   /**
