@@ -1,7 +1,7 @@
 export type { AdversarialReviewConfig } from "./adversarial-review.js";
 export { generateAdversarialReviewWorkflow, generateMultiPerspectiveWorkflow } from "./adversarial-review.js";
 export type { AgentRunOptions, AgentRunResult, WorkflowAgentOptions } from "./agent.js";
-export { listAvailableModelSpecs, WorkflowAgent } from "./agent.js";
+export { listAvailableModelSpecs, resolveAgentThinkingLevel, WorkflowAgent } from "./agent.js";
 export type { AgentHistoryEntry, AgentHistoryKind, AgentHistoryRole } from "./agent-history.js";
 export { compactAgentHistory } from "./agent-history.js";
 export type { AgentDefinition, AgentRegistry } from "./agent-registry.js";
@@ -73,18 +73,28 @@ export {
   registerSavedWorkflow,
 } from "./saved-commands.js";
 export { createSharedStoreTools, SharedStore } from "./shared-store.js";
-export type { StructuredOutputCapture, StructuredOutputToolOptions } from "./structured-output.js";
+export type {
+  LiteralJsonSchema,
+  LiteralSchemaOutput,
+  LiteralStructuredOutputToolOptions,
+  SchemaOutput,
+  StructuredOutputCapture,
+  StructuredOutputToolOptions,
+  WorkflowSchema,
+} from "./structured-output.js";
 export { createStructuredOutputTool } from "./structured-output.js";
 export { deliverText, installResultDelivery, installTaskPanel, type TaskPanelOptions } from "./task-panel.js";
 export { createWebFetchTool, createWebSearchTool, createWebTools } from "./web-tools.js";
 export type {
   AgentOptions,
+  AgentTypePolicy,
   JournalEntry,
   SharedRuntime,
   WorkflowMeta,
   WorkflowMetaPhase,
   WorkflowRunOptions,
   WorkflowRunResult,
+  WorkflowScriptDescriptor,
 } from "./workflow.js";
 export { parseWorkflowScript, runWorkflow } from "./workflow.js";
 export { registerWorkflowCommands } from "./workflow-commands.js";

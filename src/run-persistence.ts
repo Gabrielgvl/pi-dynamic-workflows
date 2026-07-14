@@ -32,6 +32,8 @@ export interface PersistedRunState {
   workflowName: string;
   script: string;
   args?: unknown;
+  /** Effective unknown-agent policy for this execution, including per-run overrides. */
+  agentTypePolicy?: "fallback" | "error";
   /** The pi session this run belongs to. Runs persist on disk across sessions but
    * the navigator shows only the current session's runs (undefined = legacy/global). */
   sessionId?: string;
@@ -57,8 +59,16 @@ export interface PersistedRunState {
     cacheRead?: number;
     cacheWrite?: number;
   };
-  /** Cached agent results for resume, keyed by deterministic call index. */
-  journal?: Array<{ index: number; hash: string; result: unknown }>;
+  /** Cached agent/atomic-child results for resume, keyed by deterministic call index. */
+  journal?: Array<{
+    index: number;
+    hash: string;
+    result: unknown;
+    storeDelta?: Record<string, unknown>;
+    storeVersions?: Record<string, number>;
+    agentCount?: number;
+    resultKind?: "void";
+  }>;
 }
 
 export interface RunPersistence {

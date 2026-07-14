@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
+import { readFileSync, realpathSync, statSync } from "node:fs";
+import { isAbsolute, relative, resolve } from "node:path";
 import vm from "node:vm";
 import type { Node } from "acorn";
 import { parse } from "acorn";
-import type { TSchema } from "typebox";
 import type { AgentUsage } from "./agent.js";
 import { WorkflowAgent, type WorkflowAgentOptions } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
@@ -15,9 +16,17 @@ import {
 } from "./agent-registry.js";
 import { DEFAULT_AGENT_TIMEOUT_MS, MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CONCURRENCY } from "./config.js";
 import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
+import {
+  type JsonTreePrototypes,
+  normalizeJsonChildArgs,
+  normalizeJsonResult,
+  normalizeJsonTree,
+} from "./json-value.js";
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
+import { isThinkingLevel, type ModelThinkingLevel } from "./model-spec.js";
 import { createAgentStoreTools, SharedStore } from "./shared-store.js";
+import type { WorkflowSchema } from "./structured-output.js";
 import { createWorktree, removeWorktree, type Worktree } from "./worktree.js";
 
 export interface WorkflowMetaPhase {
@@ -25,6 +34,12 @@ export interface WorkflowMetaPhase {
   detail?: string;
   model?: string;
 }
+
+export interface WorkflowScriptDescriptor {
+  scriptPath: string;
+}
+
+export type AgentTypePolicy = "fallback" | "error";
 
 export interface WorkflowMeta {
   name: string;
@@ -47,6 +62,12 @@ export interface JournalEntry {
    * which agent finished first. Absent on older journal entries.
    */
   storeDelta?: Record<string, unknown>;
+  /** Monotonic execution-time version for each storeDelta key. */
+  storeVersions?: Record<string, number>;
+  /** Logical child agents represented by an atomic workflow() entry. */
+  agentCount?: number;
+  /** Explicit encoding for an atomic child that completed with no return value. */
+  resultKind?: "void";
 }
 
 /**
@@ -74,6 +95,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    * fallback). Injectable for tests.
    */
   agentRegistry?: AgentRegistry;
+  /** Unknown explicit agentType behavior. Default: "fallback". */
+  agentTypePolicy?: AgentTypePolicy;
   concurrency?: number;
   /** Retry attempts after a recoverable agent failure. Default 0. */
   agentRetries?: number;
@@ -93,6 +116,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   resumeFromRunId?: string;
   /** Called after each live agent completes so the caller can persist the journal. */
   onAgentJournal?: (entry: JournalEntry) => void;
+  /** Internal: require this invocation's result to be an exact persisted JSON snapshot. */
+  requireJsonResult?: boolean;
   /** Internal: shared runtime inherited by a nested workflow() call. */
   sharedRuntime?: SharedRuntime;
   /**
@@ -152,7 +177,7 @@ export interface WorkflowRunResult<T = unknown> {
   };
 }
 
-export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema | undefined> {
+export interface AgentOptions<TSchemaDef extends WorkflowSchema | undefined = WorkflowSchema | undefined> {
   label?: string;
   phase?: string;
   schema?: TSchemaDef;
@@ -170,6 +195,8 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    * no configured entry it falls back to the session's main model.
    */
   tier?: string;
+  /** Explicit Pi thinking level; wins over model suffix and inherited thinking. */
+  effort?: ModelThinkingLevel;
   isolation?: "worktree";
   /**
    * Name of a registered subagent definition (`.pi/agents/<name>.md`, project >
@@ -224,7 +251,44 @@ interface RuntimeState {
 type AnyNode = Node & { [key: string]: any; start: number; end: number };
 
 // Parse-time author hint (fast feedback). The real enforcement is DETERMINISM_PRELUDE.
-const DETERMINISM_BLOCKLIST = /\bDate\s*\.\s*now\b|\bMath\s*\.\s*random\b|\bnew\s+Date\s*\(\s*\)/;
+// This intentionally covers the same dot-property and zero-argument constructor
+// forms as the former source-text blocklist. Computed and optional-chaining forms
+// remain outside this parse-time check; the runtime prelude remains authoritative.
+function isNondeterministicCall(node: AnyNode): boolean {
+  if (node.type === "NewExpression") {
+    const callee = node.callee as AnyNode;
+    return callee.type === "Identifier" && callee.name === "Date" && (node.arguments as AnyNode[]).length === 0;
+  }
+
+  if (node.type !== "CallExpression") return false;
+  const callee = node.callee as AnyNode;
+  if (callee.type !== "MemberExpression" || callee.computed) return false;
+  const object = callee.object as AnyNode;
+  const property = callee.property as AnyNode;
+  return (
+    object.type === "Identifier" &&
+    property.type === "Identifier" &&
+    ((object.name === "Date" && property.name === "now") || (object.name === "Math" && property.name === "random"))
+  );
+}
+
+function containsNondeterministicCall(node: AnyNode): boolean {
+  if (isNondeterministicCall(node)) return true;
+  for (const value of Object.values(node)) {
+    if (value && typeof value === "object") {
+      if (Array.isArray(value)) {
+        if (
+          value.some((child) => child && typeof child === "object" && containsNondeterministicCall(child as AnyNode))
+        ) {
+          return true;
+        }
+      } else if (containsNondeterministicCall(value as AnyNode)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
 
 /**
  * Runtime determinism hardening, run inside the vm realm BEFORE the user script.
@@ -270,6 +334,14 @@ export async function runWorkflow<T = unknown>(
   const agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
   const runId = options.runId ?? `run-${started.toString(36)}`;
   const baseCwd = options.cwd ?? process.cwd();
+  const agentTypePolicy = options.agentTypePolicy ?? "fallback";
+  if (agentTypePolicy !== "fallback" && agentTypePolicy !== "error") {
+    throw new WorkflowError(
+      'agentTypePolicy must be "fallback" or "error"',
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  }
   // Snapshot the agentType registry ONCE per run so two agent() calls can't
   // observe a mid-run edit (determinism); a later resume re-reads it.
   const agentRegistry = options.agentRegistry ?? loadAgentRegistry(baseCwd);
@@ -308,10 +380,14 @@ export async function runWorkflow<T = unknown>(
     depth: 0,
   };
   const limiter = shared.limiter;
+  // Unlike shared.agentCount, this counter belongs only to this invocation. It is
+  // what an atomic parent journal records, so concurrent parent work is excluded.
+  let localAgentCount = 0;
 
   // One store instance per run; nested workflow() calls inherit the parent's store
   // so all agents across nesting levels share the same key-value space.
   const store: SharedStore = options.sharedStore ?? new SharedStore();
+  let scriptJsonPrototypes: JsonTreePrototypes | undefined;
 
   const log = (message: string) => {
     const text = String(message);
@@ -386,10 +462,27 @@ export async function runWorkflow<T = unknown>(
     }
 
     const requestedLabel = agentOptions.label?.trim();
+    if (
+      agentOptions.effort !== undefined &&
+      (typeof agentOptions.effort !== "string" || !isThinkingLevel(agentOptions.effort))
+    ) {
+      throw new WorkflowError(
+        `Unknown effort "${String(agentOptions.effort)}"`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
 
     // Resolve a named agentType to its bound definition (tools/model/prompt).
     const agentDef = resolveAgentType(agentOptions.agentType, agentRegistry);
     if (agentOptions.agentType && !agentDef) {
+      if (agentTypePolicy === "error") {
+        throw new WorkflowError(
+          `Unknown agentType "${agentOptions.agentType}"`,
+          WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+          { recoverable: false },
+        );
+      }
       log(`unknown agentType "${agentOptions.agentType}"; using default tools/model`);
     }
 
@@ -425,6 +518,7 @@ export async function runWorkflow<T = unknown>(
     // spent accrues after each agent, matching Claude Code; in-flight agents may
     // push slightly past total, then further agent() calls throw.)
     shared.agentCount++;
+    localAgentCount++;
     const label = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount);
 
     // Longest-unchanged-prefix resume: replay a cached result only while the
@@ -438,10 +532,9 @@ export async function runWorkflow<T = unknown>(
     if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
       options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
       options.onAgentEnd?.({ label, phase: assignedPhase, result: cached.result, tokens: 0, model: displayModel });
-      // Apply this agent's write delta so live agents later in the run see a
-      // consistent store. Additive apply preserves parallel-agent writes that
-      // came from higher-callIndex agents finishing before this one.
-      if (cached.storeDelta) store.applyDelta(cached.storeDelta);
+      // Captured write versions preserve live execution order even though replay
+      // visits calls in lexical call-index order.
+      if (cached.storeDelta) store.applyDelta(cached.storeDelta, cached.storeVersions);
       return cached.result;
     }
     // A genuine miss (no journal entry, or the hash changed) marks where the
@@ -489,28 +582,30 @@ export async function runWorkflow<T = unknown>(
       try {
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           usage = undefined;
+          const attemptDeltaKey = `${deltaKey}:attempt${attempt}`;
+          const attemptController = new AbortController();
+          const attemptSignal = combineAbortSignals(options.signal, attemptController.signal);
           try {
             throwIfAborted();
 
-            // Run agent with timeout
+            // Each retry has its own cancellation signal and store scope. A timed-out
+            // runner may ignore cancellation, but its closed tools cannot contaminate
+            // a later attempt.
             const result = await withTimeout(
               agentRunner.run(prompt, {
                 label,
                 // Identifiable name for persisted sessions (persistAgentSessions).
                 sessionName: `workflow:${runId} ${label}`,
                 schema: agentOptions.schema,
-                signal: options.signal,
+                signal: attemptSignal,
                 instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef, resolvedIsolation),
                 model: modelSpec,
                 tier: agentOptions.tier,
+                effort: agentOptions.effort,
                 modelRegistry: options.modelRegistry,
                 toolNames: agentDef?.tools,
                 disallowedToolNames: agentDef?.disallowedTools,
-                // Per-agent store tools track this agent's writes by the
-                // run-unique deltaKey so the delta can be journaled and replayed
-                // correctly on resume, even when a nested workflow() run shares
-                // this store concurrently with the parent run.
-                systemTools: createAgentStoreTools(store, deltaKey),
+                systemTools: createAgentStoreTools(store, attemptDeltaKey),
                 cwd: runCwd,
                 onModelResolved: (id: string) => {
                   displayModel = id;
@@ -528,6 +623,7 @@ export async function runWorkflow<T = unknown>(
               }),
               timeout,
               label,
+              () => attemptController.abort(),
             );
 
             throwIfAborted();
@@ -539,12 +635,15 @@ export async function runWorkflow<T = unknown>(
             }
 
             const tokens = recordTokens(result);
+            const preparedDelta = store.prepareDelta(attemptDeltaKey);
             options.onAgentJournal?.({
               index: callIndex,
               hash: callHash,
               result,
-              storeDelta: store.commitDelta(deltaKey),
+              storeDelta: preparedDelta.values,
+              storeVersions: preparedDelta.versions,
             });
+            store.commitDelta(attemptDeltaKey);
             options.onAgentEnd?.({
               label,
               phase: assignedPhase,
@@ -555,6 +654,10 @@ export async function runWorkflow<T = unknown>(
             });
             return result;
           } catch (error) {
+            attemptController.abort();
+            // A failed attempt has no durable journal entry, so its writes must not
+            // remain observable or contaminate a retry/child invocation delta.
+            store.discardDelta(attemptDeltaKey);
             if (options.signal?.aborted) throw error;
 
             const workflowError = wrapError(error, { agentLabel: label });
@@ -652,33 +755,109 @@ export async function runWorkflow<T = unknown>(
     );
   };
 
-  // Nested workflow(): run a saved workflow (or a raw script) inline, sharing this
-  // run's limiter/counters/budget so the global caps hold. One level deep only.
-  const workflowFn = async (nameOrScript: string, childArgs?: unknown) => {
+  // Nested workflow(): run a saved workflow, raw script, or cwd-contained script
+  // path inline. The completed child is one atomic parent journal entry: a crash
+  // during the child leaves no partial parent entry, so resume reruns it entirely.
+  const workflowFn = async (nameOrDescriptor: string | WorkflowScriptDescriptor, ...childArgList: unknown[]) => {
     throwIfAborted();
     if (shared.depth >= 1) {
       throw new WorkflowError("workflow() can nest only one level deep", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
         recoverable: false,
       });
     }
-    const resolved = options.loadSavedWorkflow?.(String(nameOrScript));
-    const childScript = resolved ?? String(nameOrScript);
+    if (childArgList.length > 1) {
+      throw scriptValidationError("workflow() accepts at most one child args value");
+    }
+    const childArgsSupplied = childArgList.length === 1;
+    let childArgs: unknown;
+    if (childArgsSupplied) {
+      try {
+        childArgs = normalizeJsonChildArgs(childArgList[0], scriptJsonPrototypes);
+      } catch {
+        throw scriptValidationError("workflow() child args must be deterministic JSON-serializable values");
+      }
+    }
+
+    const resolved = resolveChildWorkflow(nameOrDescriptor, baseCwd, options.loadSavedWorkflow);
+    const callIndex = state.callSeq++;
+    const callHash = hashWorkflowCall(
+      resolved.identity,
+      resolved.script,
+      childArgsSupplied,
+      childArgs,
+      agentRegistrySnapshotKey(agentRegistry),
+      agentTypePolicy,
+    );
+    const cached = options.resumeJournal?.get(callIndex);
+    const hashMatches = cached != null && cached.hash === callHash;
+    if (hashMatches && callIndex < state.firstMiss) {
+      const childAgentCount = validateReplayedAgentCount(cached.agentCount);
+      let replayResult: unknown;
+      if (cached.resultKind === "void") {
+        if (cached.result !== null) {
+          throw scriptValidationError("replayed atomic void child result must use the canonical null encoding");
+        }
+        replayResult = undefined;
+      } else {
+        try {
+          replayResult = normalizeJsonResult(cached.result);
+        } catch {
+          throw scriptValidationError("replayed atomic child result must be deterministic JSON-serializable values");
+        }
+      }
+      if (shared.agentCount + childAgentCount > maxAgents) {
+        throw new WorkflowError(
+          `Agent limit exceeded (${maxAgents}). Use maxAgents option to increase the limit.`,
+          WorkflowErrorCode.AGENT_LIMIT_EXCEEDED,
+          { recoverable: false },
+        );
+      }
+      shared.agentCount += childAgentCount;
+      localAgentCount += childAgentCount;
+      if (cached.storeDelta) store.applyDelta(cached.storeDelta, cached.storeVersions);
+      return replayResult;
+    }
+    if (!hashMatches) state.firstMiss = Math.min(state.firstMiss, callIndex);
+
+    const childStore = store.createChildScope();
+    // callIndex is unique for every child invocation in this parent, including
+    // sequential failed children at the same nesting depth.
+    const childRunId = `${runId}-child${callIndex}`;
     shared.depth++;
     try {
-      const child = await runWorkflow(childScript, {
+      const child = await runWorkflow(resolved.script, {
         ...options,
-        args: childArgs,
+        args: childArgsSupplied ? childArgs : undefined,
+        agentRegistry,
         sharedRuntime: shared,
-        // Propagate the parent's store so nested agents share the same key-value space.
-        sharedStore: store,
-        // A nested run is its own script; never reuse the parent's resume journal.
+        // Child writes remain in an overlay until the entire invocation succeeds.
+        sharedStore: childStore,
         resumeJournal: undefined,
         resumeFromRunId: undefined,
-        runId: `${runId}-nested${shared.depth}`,
+        onAgentJournal: () => {},
+        requireJsonResult: true,
+        runId: childRunId,
         persistLogs: false,
       });
-      return child.result;
+      const childAgentCount = child.agentCount;
+      const isVoidResult = child.result === undefined;
+      const journalResult = isVoidResult ? null : normalizeJsonTree(child.result);
+      const returnedResult = isVoidResult ? undefined : normalizeJsonTree(journalResult);
+      const preparedDelta = childStore.prepareChildScope();
+      options.onAgentJournal?.({
+        index: callIndex,
+        hash: callHash,
+        result: journalResult,
+        storeDelta: preparedDelta.values,
+        storeVersions: preparedDelta.versions,
+        agentCount: childAgentCount,
+        resultKind: isVoidResult ? "void" : undefined,
+      });
+      childStore.commitChildScope(preparedDelta);
+      localAgentCount += childAgentCount;
+      return returnedResult;
     } finally {
+      childStore.dispose();
       shared.depth--;
     }
   };
@@ -857,10 +1036,12 @@ export async function runWorkflow<T = unknown>(
     const cached = options.resumeJournal?.get(callIndex);
     if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
       shared.agentCount++;
+      localAgentCount++;
       return cached.result; // replay the journaled human reply
     }
     if (cached == null || cached.hash !== callHash) state.firstMiss = Math.min(state.firstMiss, callIndex);
     shared.agentCount++;
+    localAgentCount++;
 
     let reply: unknown;
     if (options.confirm) {
@@ -909,9 +1090,21 @@ export async function runWorkflow<T = unknown>(
     // neutered in-realm by DETERMINISM_PRELUDE below.
   });
 
+  scriptJsonPrototypes = new vm.Script(
+    "({ arrayPrototype: Array.prototype, objectPrototype: Object.prototype })",
+  ).runInContext(context) as JsonTreePrototypes;
+
   const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
   try {
-    const result = await new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(context);
+    const rawResult = await new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(context);
+    let result = rawResult;
+    if (options.requireJsonResult && rawResult !== undefined) {
+      try {
+        result = normalizeJsonResult(rawResult, scriptJsonPrototypes);
+      } catch {
+        throw scriptValidationError("workflow() child result must be deterministic JSON-serializable values");
+      }
+    }
 
     // Persist logs
     const logFile = logger.persist();
@@ -927,7 +1120,7 @@ export async function runWorkflow<T = unknown>(
       result: result as T,
       logs: state.logs,
       phases: state.phases,
-      agentCount: shared.agentCount,
+      agentCount: options.sharedRuntime ? localAgentCount : shared.agentCount,
       durationMs: Date.now() - started,
       runId,
       tokenUsage: shared.tokenUsage,
@@ -940,14 +1133,6 @@ export async function runWorkflow<T = unknown>(
 }
 
 export function parseWorkflowScript(script: string): { meta: WorkflowMeta; body: string } {
-  if (DETERMINISM_BLOCKLIST.test(script)) {
-    throw new WorkflowError(
-      "Workflow scripts must be deterministic: Date.now()/Math.random()/new Date() are unavailable",
-      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
-      { recoverable: false },
-    );
-  }
-
   const ast = parse(script, {
     ecmaVersion: "latest",
     sourceType: "module",
@@ -955,6 +1140,14 @@ export function parseWorkflowScript(script: string): { meta: WorkflowMeta; body:
     allowReturnOutsideFunction: true,
     ranges: false,
   }) as AnyNode;
+
+  if (containsNondeterministicCall(ast)) {
+    throw new WorkflowError(
+      "Workflow scripts must be deterministic: Date.now()/Math.random()/new Date() are unavailable",
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  }
 
   const first = ast.body?.[0] as AnyNode | undefined;
   if (first?.type !== "ExportNamedDeclaration") {
@@ -1085,6 +1278,101 @@ function defaultAgentLabel(phase: string | undefined, index: number): string {
   return phase ? `${phase} agent ${index}` : `agent ${index}`;
 }
 
+function scriptValidationError(message: string): WorkflowError {
+  return new WorkflowError(message, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, { recoverable: false });
+}
+
+function resolveChildWorkflow(
+  reference: string | WorkflowScriptDescriptor,
+  cwd: string,
+  loadSavedWorkflow: ((name: string) => string | undefined) | undefined,
+): { script: string; identity: string } {
+  if (typeof reference === "string") {
+    const saved = loadSavedWorkflow?.(reference);
+    return saved === undefined
+      ? { script: reference, identity: `raw:${reference}` }
+      : { script: saved, identity: `saved:${reference}` };
+  }
+
+  if (!isWorkflowScriptDescriptor(reference)) {
+    throw scriptValidationError("workflow() descriptor must contain exactly one string scriptPath");
+  }
+
+  const root = realpathSync(cwd);
+  const candidate = resolve(root, reference.scriptPath);
+  if (!isPathInside(root, candidate)) {
+    throw scriptValidationError("workflow() scriptPath escapes workflow cwd");
+  }
+
+  let realPath: string;
+  try {
+    realPath = realpathSync(candidate);
+  } catch {
+    throw scriptValidationError("workflow() scriptPath does not exist");
+  }
+  if (!isPathInside(root, realPath)) {
+    throw scriptValidationError("workflow() scriptPath escapes workflow cwd");
+  }
+  if (!statSync(realPath).isFile()) {
+    throw scriptValidationError("workflow() scriptPath must reference a file");
+  }
+  return { script: readFileSync(realPath, "utf8"), identity: `path:${realPath}` };
+}
+
+function isWorkflowScriptDescriptor(value: unknown): value is WorkflowScriptDescriptor {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== 1 || keys[0] !== "scriptPath") return false;
+  const scriptPath = (value as { scriptPath?: unknown }).scriptPath;
+  return typeof scriptPath === "string" && scriptPath.trim().length > 0;
+}
+
+function isPathInside(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return (
+    rel === "" ||
+    (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`))
+  );
+}
+
+function hashWorkflowCall(
+  identity: string,
+  script: string,
+  argsSupplied: boolean,
+  args: unknown,
+  agentRegistryKey: string,
+  agentTypePolicy: AgentTypePolicy,
+): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        identity,
+        script,
+        argsSupplied,
+        args: argsSupplied ? args : null,
+        agentRegistry: agentRegistryKey,
+        agentTypePolicy,
+      }),
+    )
+    .digest("hex");
+}
+
+function agentRegistrySnapshotKey(registry: AgentRegistry): string {
+  return JSON.stringify(
+    [...registry.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([name, definition]) => [name, agentDefinitionKey(definition)]),
+  );
+}
+
+function validateReplayedAgentCount(value: unknown): number {
+  if (value === undefined) return 0;
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw scriptValidationError("replayed atomic child agentCount must be a non-negative integer");
+  }
+  return value as number;
+}
+
 /** Stable identity hash for an agent() call — a cache miss on resume when anything changes. */
 function hashCheckpoint(promptText: string, options: CheckpointOptions): string {
   const identity = JSON.stringify({
@@ -1106,6 +1394,7 @@ function hashAgentCall(
     prompt,
     model: model ?? null,
     tier: options.tier ?? null,
+    effort: options.effort ?? null,
     phase: phase ?? null,
     agentType: options.agentType ?? null,
     // Resolved definition (tools/model/prompt) so editing an agent .md invalidates
@@ -1135,7 +1424,7 @@ function buildAgentInstructions(
   return lines.length ? lines.join("\n\n") : undefined;
 }
 
-function isEmptyTextAgentResult(result: unknown, schema: TSchema | undefined): boolean {
+function isEmptyTextAgentResult(result: unknown, schema: WorkflowSchema | undefined): boolean {
   return schema === undefined && typeof result === "string" && result.trim().length === 0;
 }
 
@@ -1156,13 +1445,23 @@ function normalizeAgentRetries(value: unknown): number {
 /**
  * Run a promise with a timeout.
  */
-async function withTimeout<T>(promise: Promise<T>, ms: number | null, label: string): Promise<T> {
+function combineAbortSignals(parent: AbortSignal | undefined, attempt: AbortSignal): AbortSignal {
+  return parent ? AbortSignal.any([parent, attempt]) : attempt;
+}
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number | null,
+  label: string,
+  onTimeout?: () => void,
+): Promise<T> {
   if (ms === null) return promise;
 
   let timeoutId: NodeJS.Timeout | undefined;
 
   const timeoutPromise = new Promise<never>((_, reject) => {
     timeoutId = setTimeout(() => {
+      onTimeout?.();
       reject(
         new WorkflowError(
           `Agent "${label}" timed out after ${ms}ms; raise or omit timeoutMs/agentTimeoutMs to allow longer runs`,

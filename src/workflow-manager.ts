@@ -7,6 +7,7 @@ import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { WorkflowAgent } from "./agent.js";
 import { preview, type WorkflowSnapshot } from "./display.js";
 import { WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { normalizeJsonTree } from "./json-value.js";
 import {
   createRunPersistence,
   generateRunId,
@@ -15,7 +16,13 @@ import {
   type RunPersistence,
   type RunStatus,
 } from "./run-persistence.js";
-import { type JournalEntry, parseWorkflowScript, runWorkflow, type WorkflowRunResult } from "./workflow.js";
+import {
+  type AgentTypePolicy,
+  type JournalEntry,
+  parseWorkflowScript,
+  runWorkflow,
+  type WorkflowRunResult,
+} from "./workflow.js";
 
 export interface ManagedRun {
   runId: string;
@@ -28,6 +35,8 @@ export interface ManagedRun {
   /** The real script, kept so the run can be resumed. */
   script: string;
   args?: unknown;
+  /** Effective policy for this run; persisted so cold resume keeps strict overrides. */
+  agentTypePolicy: AgentTypePolicy;
   /** Accumulated agent results for resume (deterministic call index -> result). */
   journal: JournalEntry[];
   /** Cross-process execution lease for this run, when it is actively executing. */
@@ -59,6 +68,8 @@ export interface ExecOptions {
   concurrency?: number;
   /** Retry attempts after recoverable agent failures for this execution. */
   agentRetries?: number;
+  /** Unknown explicit agentType behavior. Default: manager policy, then fallback. */
+  agentTypePolicy?: AgentTypePolicy;
   /** Resolve a checkpoint() question with a human reply (only for UI-bearing runs). */
   confirm?: (promptText: string, options: unknown) => Promise<unknown>;
 }
@@ -84,11 +95,31 @@ export interface WorkflowManagerOptions {
   defaultAgentTimeoutMs?: number | null;
   /** Default retry attempts after recoverable agent failures. */
   defaultAgentRetries?: number;
+  /** Unknown explicit agentType behavior. Default: "fallback". */
+  agentTypePolicy?: AgentTypePolicy;
   /**
    * Persist each subagent transcript as a real pi session file under the
    * standard sessions directory. Default false (in-memory, discarded).
    */
   persistAgentSessions?: boolean;
+}
+
+const UNSAFE_MERGE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function isSafePlainObject(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== "string" || UNSAFE_MERGE_KEYS.has(key)) return false;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor?.enumerable || !("value" in descriptor)) return false;
+  }
+  return true;
+}
+
+function resumeValidationError(message: string): WorkflowError {
+  return new WorkflowError(message, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, { recoverable: false });
 }
 
 export class WorkflowManager extends EventEmitter {
@@ -106,6 +137,7 @@ export class WorkflowManager extends EventEmitter {
   private sessionId?: string;
   private defaultAgentTimeoutMs: number | null;
   private defaultAgentRetries: number;
+  private agentTypePolicy: AgentTypePolicy;
   private persistAgentSessions: boolean;
 
   constructor(options: WorkflowManagerOptions = {}) {
@@ -119,6 +151,7 @@ export class WorkflowManager extends EventEmitter {
     this.sessionId = options.sessionId;
     this.defaultAgentTimeoutMs = options.defaultAgentTimeoutMs ?? null;
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
+    this.agentTypePolicy = options.agentTypePolicy ?? "fallback";
     this.persistAgentSessions = options.persistAgentSessions ?? false;
     this.persistence = createRunPersistence(this.cwd);
     this.recoverStaleRuns();
@@ -214,6 +247,7 @@ export class WorkflowManager extends EventEmitter {
       startedAt: new Date(),
       script,
       args,
+      agentTypePolicy: exec.agentTypePolicy ?? this.agentTypePolicy,
       journal: [],
       background: true,
       lease,
@@ -228,6 +262,7 @@ export class WorkflowManager extends EventEmitter {
         workflowName: parsed.meta.name,
         script,
         args,
+        agentTypePolicy: managed.agentTypePolicy,
         sessionId: this.sessionId,
         status: "running",
         phases: managed.snapshot.phases,
@@ -260,7 +295,7 @@ export class WorkflowManager extends EventEmitter {
    * a caller (e.g. the workflow tool) drive its own inline display.
    */
   async runSync(script: string, args?: unknown, exec: ExecOptions = {}): Promise<WorkflowRunResult> {
-    const managed = this.createManaged(script, args);
+    const managed = this.createManaged(script, args, exec.agentTypePolicy ?? this.agentTypePolicy);
     const lease = this.persistence.acquireRunLease(managed.runId);
     if (!lease) throw new Error(`Could not acquire workflow run lease for ${managed.runId}`);
     managed.lease = lease;
@@ -272,7 +307,7 @@ export class WorkflowManager extends EventEmitter {
   }
 
   /** Build a fresh managed run with an empty snapshot. */
-  private createManaged(script: string, args?: unknown): ManagedRun {
+  private createManaged(script: string, args: unknown, agentTypePolicy: AgentTypePolicy): ManagedRun {
     const parsed = parseWorkflowScript(script);
     const slug = parsed.meta.name
       ? parsed.meta.name
@@ -300,6 +335,7 @@ export class WorkflowManager extends EventEmitter {
       startedAt: new Date(),
       script,
       args,
+      agentTypePolicy,
       journal: [],
       background: false,
     };
@@ -342,6 +378,7 @@ export class WorkflowManager extends EventEmitter {
         signal: managed.controller.signal,
         concurrency: resolvedConcurrency,
         agentRetries: resolvedAgentRetries,
+        agentTypePolicy: managed.agentTypePolicy,
         maxAgents,
         agentTimeoutMs: resolvedAgentTimeoutMs,
         tokenBudget,
@@ -473,7 +510,7 @@ export class WorkflowManager extends EventEmitter {
     managed.lease = undefined;
   }
 
-  private persistRun(managed: ManagedRun) {
+  private persistRun(managed: ManagedRun, required = false) {
     try {
       this.persistence.save({
         runId: managed.runId,
@@ -482,6 +519,7 @@ export class WorkflowManager extends EventEmitter {
         // in workflow run storage — protect via directory permissions, not blanking.
         script: managed.script,
         args: managed.args,
+        agentTypePolicy: managed.agentTypePolicy,
         sessionId: this.sessionId,
         journal: managed.journal,
         status: managed.status,
@@ -520,6 +558,7 @@ export class WorkflowManager extends EventEmitter {
         durationMs: managed.result?.durationMs,
       });
     } catch (err) {
+      if (required) throw err;
       // Persistence is best-effort: the run is still healthy in memory.
       // Log so an operator debugging state-loss has a lead, but never crash
       // the workflow over a disk-full situation.
@@ -546,7 +585,9 @@ export class WorkflowManager extends EventEmitter {
    * Resume an interrupted run: replay journaled results for the unchanged prefix
    * and run the rest live. Returns false if there is nothing resumable.
    */
-  async resume(runId: string): Promise<boolean> {
+  async resume(runId: string, ...argsPatchList: [] | [argsPatch: Record<string, unknown>]): Promise<boolean> {
+    const patchSupplied = argsPatchList.length === 1;
+    const argsPatch = argsPatchList[0];
     // Guard: refuse to resume a run that is already running, or one that was
     // intentionally aborted (pause/stop/Esc). Paused and failed runs can restart.
     const active = this.runs.get(runId);
@@ -555,6 +596,26 @@ export class WorkflowManager extends EventEmitter {
 
     const persisted = this.persistence.load(runId);
     if (!persisted?.script || persisted.status === "completed" || persisted.status === "aborted") return false;
+
+    let resumedArgs = persisted.args;
+    if (patchSupplied) {
+      if (!isSafePlainObject(argsPatch)) {
+        throw resumeValidationError("resume argsPatch must be a safe plain object");
+      }
+      if (persisted.args !== undefined && !isSafePlainObject(persisted.args)) {
+        throw resumeValidationError("persisted workflow args are incompatible with argsPatch");
+      }
+      try {
+        const normalizedPatch = normalizeJsonTree(argsPatch) as Record<string, unknown>;
+        resumedArgs = normalizeJsonTree({
+          ...((persisted.args as Record<string, unknown> | undefined) ?? {}),
+          ...normalizedPatch,
+        });
+      } catch {
+        throw resumeValidationError("resume argsPatch must contain only plain JSON values");
+      }
+    }
+
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) return false;
 
@@ -575,20 +636,28 @@ export class WorkflowManager extends EventEmitter {
       controller,
       startedAt: new Date(),
       script: persisted.script,
-      args: persisted.args,
+      args: resumedArgs,
+      agentTypePolicy: persisted.agentTypePolicy ?? this.agentTypePolicy,
       journal: persisted.journal ?? [],
       background: true,
       lease,
     };
     this.runs.set(runId, managed);
     // Persist before notifying renderers: listRuns() is their source of truth for
-    // lifecycle status, while getRun() supplies the live in-memory snapshot.
-    this.persistRun(managed);
+    // lifecycle status, while getRun() supplies the live in-memory snapshot. A
+    // supplied argsPatch must be durable before any execution starts.
+    try {
+      this.persistRun(managed, patchSupplied);
+    } catch (error) {
+      this.releaseRunLease(managed);
+      this.runs.delete(runId);
+      throw error;
+    }
 
     const resumeJournal = new Map((persisted.journal ?? []).map((e) => [e.index, e] as const));
     this.emit("resumed", { runId });
     // Run in the background; executeRun records status/errors on the managed run.
-    void this.executeRun(managed, persisted.script, persisted.args, { resumeJournal }).catch(() => {});
+    void this.executeRun(managed, persisted.script, resumedArgs, { resumeJournal }).catch(() => {});
     return true;
   }
 

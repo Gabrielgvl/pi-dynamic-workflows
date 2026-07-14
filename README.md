@@ -189,7 +189,7 @@ The full guide — every global, agent option, `agentType` definitions, structur
 | `pipeline(items, ...stages)` | Fan items through sequential stages `(prev, original, index)`. |
 | `phase(title, { budget? })` | Group agents in the live view; optional per-phase token sub-budget. |
 | `verify` / `judgePanel` / `loopUntilDry` / `completenessCheck` | Built-in quality patterns. |
-| `workflow(name, args)` | Run a saved workflow inline (shares the global caps). |
+| `workflow(nameOrSourceOrDescriptor, args)` | Run a saved name, raw source string, or `{ scriptPath: "child.js" }` inline (shares global caps). |
 | `checkpoint(prompt, opts)` | A journaled, replayable human approval gate. |
 | `budget` | `{ total, spent(), remaining() }` real-token tracker. |
 
@@ -197,11 +197,16 @@ The full guide — every global, agent option, `agentType` definitions, structur
 | --- | --- |
 | `tier` | `"small"` \| `"medium"` \| `"big"` — coarse model routing (configure via `/workflows-models`; tiers may store `provider/modelId:thinking`). |
 | `model` | Exact `provider/modelId` or `provider/modelId:thinking` (always wins over `tier`). |
+| `effort` | Explicit Pi thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. It wins over a model suffix and inherited session thinking. |
 | `agentType` | A named definition (`.pi/agents/<name>.md` project-level, or `~/.pi/agent/agents/<name>.md` user-level — `~/.pi/agents/<name>.md` still works as a deprecated fallback) binding tools + model + role prompt. |
 | `isolation: "worktree"` | Run in a throwaway git worktree for conflict-free parallel edits. |
-| `schema` | JSON Schema → the subagent returns a validated object. |
+| `schema` | TypeBox or a plain JSON Schema → the subagent returns a validated object. Literal schemas support the tested TypeBox-compatible subset: scalar types, objects (`properties`/`required`), and homogeneous arrays (`items`). |
 | `label` / `phase` / `timeoutMs` | Display label / phase override / optional per-agent hard timeout. Omit `timeoutMs` for no hard timeout. |
 | `retries` | Retry attempts after a recoverable failure (timeout, connection failure, empty output) for this agent. Overrides the run-level `agentRetries`. Default `0`. |
+
+Nested `workflow()` calls remain limited to one level. A `{ scriptPath }` is resolved from the workflow cwd; relative paths and absolute paths inside that realpath root are allowed, while traversal, symlink escapes, missing paths, and directories are rejected. Child args must be deterministic JSON-serializable values (no `undefined`, functions, symbols, bigint, non-finite numbers, or cycles). A successful child is one atomic parent journal entry containing its result, shared-store delta, and logical child-agent count. Resume skips an unchanged child; changing its source or args reruns it entirely, and interrupted children leave no partial parent entry.
+
+Unknown explicit `agentType` names keep the existing fallback behavior by default. Set `agentTypePolicy: "error"` in `runWorkflow` or `WorkflowManager` options to reject an unknown explicit name before creating a runner session; registered and untyped agents are unaffected. `WorkflowManager.resume(runId, argsPatch?)` optionally performs a safe shallow plain-object merge where supplied keys win and persists the merged args before execution. Arrays, null, non-objects, prototype keys, and incompatible persisted args are rejected; omitting `argsPatch` preserves the existing resume behavior.
 
 By default, workflows do not set a run-wide token budget or per-agent hard timeout. Use the `workflow` tool's `tokenBudget` / `agentTimeoutMs`, per-phase budgets, or per-agent `timeoutMs` only when you want an explicit cap. A global fallback timeout can also be set in `~/.pi/workflows/settings.json` as `{ "defaultAgentTimeoutMs": 600000 }`; set it to `null` or omit it for no default hard timeout.
 

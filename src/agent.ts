@@ -13,14 +13,19 @@ import {
   SettingsManager,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import type { Static, TSchema } from "typebox";
+import type { TSchema } from "typebox";
 import { Check, Convert } from "typebox/value";
 import { type AgentHistoryEntry, compactAgentHistory } from "./agent-history.js";
 import { applyToolPolicy } from "./agent-registry.js";
 import { classifyProviderLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
-import { canonicalModelSpec, resolveModelSpecWithThinking } from "./model-spec.js";
+import { canonicalModelSpec, type ModelThinkingLevel, resolveModelSpecWithThinking } from "./model-spec.js";
 import { loadModelTierConfig, type ModelTierConfig, resolveTierModel } from "./model-tier-config.js";
-import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
+import {
+  createStructuredOutputTool,
+  type SchemaOutput,
+  type StructuredOutputCapture,
+  type WorkflowSchema,
+} from "./structured-output.js";
 
 /**
  * Find a JSON object/array in free-form text: a fenced ```json block if present,
@@ -47,7 +52,7 @@ function findJsonBlock(text: string): string | undefined {
  * it toward the schema, and accept it only if it then validates. Never fabricates
  * — returns undefined unless the parsed value genuinely satisfies the schema.
  */
-export function extractValidated<T>(text: string, schema: TSchema): T | undefined {
+export function extractValidated<T>(text: string, schema: WorkflowSchema): T | undefined {
   const json = findJsonBlock(text);
   if (json === undefined) return undefined;
   let parsed: unknown;
@@ -57,8 +62,8 @@ export function extractValidated<T>(text: string, schema: TSchema): T | undefine
     return undefined;
   }
   try {
-    const converted = Convert(schema, parsed);
-    if (Check(schema, converted)) return converted as T;
+    const converted = Convert(schema as TSchema, parsed);
+    if (Check(schema as TSchema, converted)) return converted as T;
   } catch {
     // typebox can throw on exotic schemas; treat as no match.
   }
@@ -116,7 +121,7 @@ export interface StructuredSession {
 export async function resolveStructuredOutput<T>(
   session: StructuredSession,
   capture: StructuredOutputCapture<T>,
-  schema: TSchema,
+  schema: WorkflowSchema,
   options: { maxSchemaRetries?: number; signal?: AbortSignal; label?: string },
   lastText: (messages: unknown[]) => string,
 ): Promise<T> {
@@ -191,6 +196,14 @@ export function resolveAgentModelSpec(
   return undefined;
 }
 
+export function resolveAgentThinkingLevel(
+  effort: ModelThinkingLevel | undefined,
+  modelThinking: ModelThinkingLevel | undefined,
+  inheritedThinking: CreateAgentSessionOptions["thinkingLevel"] | undefined,
+): CreateAgentSessionOptions["thinkingLevel"] | undefined {
+  return effort ?? modelThinking ?? inheritedThinking;
+}
+
 export interface WorkflowAgentOptions {
   cwd?: string;
   /** Extra tools available to the subagent in addition to the structured output tool. */
@@ -253,7 +266,7 @@ export interface AgentUsage {
   cost: number;
 }
 
-export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefined> {
+export interface AgentRunOptions<TSchemaDef extends WorkflowSchema | undefined = undefined> {
   label?: string;
   /**
    * Display name recorded on the persisted session (session_info entry) when
@@ -287,6 +300,11 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * caring which concrete model backs that tier.
    */
   tier?: string;
+  /**
+   * Explicit Pi thinking level for this agent. Wins over a model `:thinking`
+   * suffix and over the inherited session thinking level.
+   */
+  effort?: ModelThinkingLevel;
   /** Called with the resolved model id once known (for display/telemetry). */
   onModelResolved?: (modelId: string) => void;
   /** Called when `model`/`tier`/phase resolved to a spec that wasn't found (fell back to session default). */
@@ -327,8 +345,8 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   modelRegistry?: ModelRegistry;
 }
 
-export type AgentRunResult<TSchemaDef extends TSchema | undefined> = TSchemaDef extends TSchema
-  ? Static<TSchemaDef>
+export type AgentRunResult<TSchemaDef extends WorkflowSchema | undefined> = TSchemaDef extends WorkflowSchema
+  ? SchemaOutput<TSchemaDef>
   : string;
 
 export class WorkflowAgent {
@@ -411,7 +429,7 @@ export class WorkflowAgent {
     unlinkSync(probePath);
   }
 
-  async run<TSchemaDef extends TSchema | undefined = undefined>(
+  async run<TSchemaDef extends WorkflowSchema | undefined = undefined>(
     prompt: string,
     options: AgentRunOptions<TSchemaDef> = {},
   ): Promise<AgentRunResult<TSchemaDef>> {
@@ -461,6 +479,11 @@ export class WorkflowAgent {
         options.onModelFallback?.(modelSpec);
       }
     }
+    const thinkingLevel = resolveAgentThinkingLevel(
+      options.effort,
+      resolvedThinkingLevel,
+      this.sessionOptions.thinkingLevel,
+    );
 
     const agentDir = getAgentDir();
     // Key persisted sessions by the runner's project cwd (this.cwd), NOT the
@@ -486,7 +509,7 @@ export class WorkflowAgent {
       ...this.sessionOptions,
       // Per-call model/thinking wins over any sessionOptions defaults.
       ...(resolvedModel ? { model: resolvedModel } : {}),
-      ...(resolvedThinkingLevel ? { thinkingLevel: resolvedThinkingLevel } : {}),
+      ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
     });
 
     // Name the persisted session so it's identifiable in session pickers.
