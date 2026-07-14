@@ -11,7 +11,7 @@ import {
   type WorkflowSnapshot,
 } from "./display.js";
 import { WorkflowError, WorkflowErrorCode } from "./errors.js";
-import { parseWorkflowScript, type WorkflowRunResult } from "./workflow.js";
+import { parseWorkflowScript, resolveWorkflowScriptPath, type WorkflowRunResult } from "./workflow.js";
 import { WorkflowManager } from "./workflow-manager.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
 import { loadWorkflowSettings } from "./workflow-settings.js";
@@ -66,14 +66,21 @@ export function agentTypeGuideline(cwd: string = process.cwd()): string | undefi
 }
 
 const workflowToolSchema = Type.Object({
-  script: Type.String({
-    description: [
-      "Required raw JavaScript workflow script, with no Markdown fences.",
-      "First statement: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{ title: 'Phase' }] }",
-      "Use phase('Name'), agent(prompt, opts), parallel(arrayOfFunctions), pipeline(items, ...stages), log(message), args, and budget. The workflow must call agent() at least once.",
-      "parallel() requires functions, not promises: await parallel(items.map(item => () => agent(...))).",
-    ].join(" "),
-  }),
+  script: Type.Optional(
+    Type.String({
+      description: [
+        "Raw JavaScript workflow script, with no Markdown fences. Provide exactly one of script or scriptPath.",
+        "First statement: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{ title: 'Phase' }] }",
+        "Use phase('Name'), agent(prompt, opts), parallel(arrayOfFunctions), pipeline(items, ...stages), log(message), args, and budget. The workflow must call agent() at least once.",
+        "parallel() requires functions, not promises: await parallel(items.map(item => () => agent(...))).",
+      ].join(" "),
+    }),
+  ),
+  scriptPath: Type.Optional(
+    Type.String({
+      description: "Path to a workflow script, rooted at ctx.cwd. Provide exactly one of script or scriptPath.",
+    }),
+  ),
   args: Type.Optional(
     Type.Any({ description: "Optional JSON value exposed to the workflow script as global `args`." }),
   ),
@@ -115,7 +122,8 @@ const workflowToolSchema = Type.Object({
 });
 
 export type WorkflowToolInput = {
-  script: string;
+  script?: string;
+  scriptPath?: string;
   args?: unknown;
   background?: boolean;
   maxAgents?: number;
@@ -159,10 +167,10 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     label: "Workflow",
     description: [
       "Execute a deterministic JavaScript workflow that orchestrates multiple subagents with agent(), parallel(), and pipeline().",
-      "script is required raw JavaScript. It must start with export const meta = { name, description, phases? } and must call agent() at least once.",
+      "Provide exactly one of script (raw JavaScript) or scriptPath (a file rooted at ctx.cwd). The source must start with export const meta = { name, description, phases? } and must call agent() at least once.",
     ].join(" "),
     promptSnippet:
-      "Run a deterministic JavaScript workflow. Required script header: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{ title: 'Phase' }] }.",
+      "Run a deterministic JavaScript workflow using exactly one of script (raw source) or scriptPath (a file rooted at ctx.cwd). Source header: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{ title: 'Phase' }] }.",
     // Lazy accessor: the SDK re-reads definition.promptGuidelines on every
     // tool-registry refresh, so each read sees the manager's registry as it
     // stands then (setModelRegistry runs on session_start, after tool creation).
@@ -171,7 +179,8 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     get promptGuidelines() {
       return [
         "Use workflow only when the user explicitly asks for a workflow, workflows, fan-out, or multi-agent orchestration.",
-        "For workflow, always pass one raw JavaScript string in the required script parameter; do not include Markdown fences or prose around the script.",
+        "For workflow, provide exactly one of script (raw JavaScript) or scriptPath (a file rooted at ctx.cwd); do not provide both or neither.",
+        "For workflow, raw script must not include Markdown fences or prose around it; scriptPath is read fresh for each call and must be a file inside ctx.cwd (no traversal or symlink escapes).",
         "For workflow, the script's first statement must be `export const meta = { name: 'short_snake_case', description: 'non-empty human description', phases: [{ title: 'Phase name' }] }`; meta.name and meta.description are required non-empty strings.",
         "For workflow, write plain JavaScript after the meta export. Do not use TypeScript syntax, imports, require(), fs, Date.now(), Math.random(), or new Date().",
         "For workflow, available globals are agent(prompt, opts), parallel(thunks), pipeline(items, ...stages), phase(title), log(message), args, cwd, process.cwd(), and budget. Every workflow must call agent() at least once; do not use workflow only to declare phases or return a static object.",
@@ -201,7 +210,8 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       return normalizeWorkflowToolArgs(args);
     },
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const script = normalizeWorkflowScript(params.script);
+      const executionCwd = (ctx as { cwd?: string } | undefined)?.cwd ?? cwd;
+      const script = resolveWorkflowToolSource(params, executionCwd);
       const parsed = parseWorkflowScript(script);
 
       // checkpoint() reaches the human only on a UI-bearing foreground run; a
@@ -374,10 +384,26 @@ export function backgroundStartedText(name: string, runId: string): string {
 }
 
 function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {
-  if (!args || typeof args !== "object") throw new Error("workflow requires an object argument with a script string");
+  if (!args || typeof args !== "object")
+    throw new Error("workflow requires an object argument with exactly one of `script` or `scriptPath`");
   const value = args as Record<string, unknown>;
-  if (typeof value.script !== "string") throw new Error("workflow requires `script` to be a string");
-  return { ...value, script: normalizeWorkflowScript(value.script) } as WorkflowToolInput;
+  const hasScript = Object.hasOwn(value, "script");
+  const hasScriptPath = Object.hasOwn(value, "scriptPath");
+  if (hasScript === hasScriptPath) throw new Error("workflow requires exactly one of `script` or `scriptPath`");
+  if (hasScript && typeof value.script !== "string") throw new Error("workflow `script` must be a string");
+  if (hasScriptPath && (typeof value.scriptPath !== "string" || value.scriptPath.trim().length === 0)) {
+    throw new Error("workflow `scriptPath` must be a non-empty string");
+  }
+  return {
+    ...value,
+    ...(hasScript ? { script: normalizeWorkflowScript(value.script as string) } : {}),
+  } as WorkflowToolInput;
+}
+
+function resolveWorkflowToolSource(params: WorkflowToolInput, cwd: string): string {
+  const normalized = normalizeWorkflowToolArgs(params);
+  if (normalized.script !== undefined) return normalized.script;
+  return resolveWorkflowScriptPath(normalized.scriptPath as string, cwd).script;
 }
 
 function normalizeWorkflowScript(script: string): string {

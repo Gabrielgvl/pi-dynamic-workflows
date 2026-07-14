@@ -1282,24 +1282,12 @@ function scriptValidationError(message: string): WorkflowError {
   return new WorkflowError(message, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, { recoverable: false });
 }
 
-function resolveChildWorkflow(
-  reference: string | WorkflowScriptDescriptor,
-  cwd: string,
-  loadSavedWorkflow: ((name: string) => string | undefined) | undefined,
-): { script: string; identity: string } {
-  if (typeof reference === "string") {
-    const saved = loadSavedWorkflow?.(reference);
-    return saved === undefined
-      ? { script: reference, identity: `raw:${reference}` }
-      : { script: saved, identity: `saved:${reference}` };
+export function resolveWorkflowScriptPath(scriptPath: string, cwd: string): { script: string; identity: string } {
+  if (typeof scriptPath !== "string" || scriptPath.trim().length === 0) {
+    throw scriptValidationError("workflow() scriptPath must be a non-empty string");
   }
-
-  if (!isWorkflowScriptDescriptor(reference)) {
-    throw scriptValidationError("workflow() descriptor must contain exactly one string scriptPath");
-  }
-
   const root = realpathSync(cwd);
-  const candidate = resolve(root, reference.scriptPath);
+  const candidate = resolve(root, scriptPath);
   if (!isPathInside(root, candidate)) {
     throw scriptValidationError("workflow() scriptPath escapes workflow cwd");
   }
@@ -1317,6 +1305,25 @@ function resolveChildWorkflow(
     throw scriptValidationError("workflow() scriptPath must reference a file");
   }
   return { script: readFileSync(realPath, "utf8"), identity: `path:${realPath}` };
+}
+
+function resolveChildWorkflow(
+  reference: string | WorkflowScriptDescriptor,
+  cwd: string,
+  loadSavedWorkflow: ((name: string) => string | undefined) | undefined,
+): { script: string; identity: string } {
+  if (typeof reference === "string") {
+    const saved = loadSavedWorkflow?.(reference);
+    return saved === undefined
+      ? { script: reference, identity: `raw:${reference}` }
+      : { script: saved, identity: `saved:${reference}` };
+  }
+
+  if (!isWorkflowScriptDescriptor(reference)) {
+    throw scriptValidationError("workflow() descriptor must contain exactly one string scriptPath");
+  }
+
+  return resolveWorkflowScriptPath(reference.scriptPath, cwd);
 }
 
 function isWorkflowScriptDescriptor(value: unknown): value is WorkflowScriptDescriptor {

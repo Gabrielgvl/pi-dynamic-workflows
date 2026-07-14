@@ -190,6 +190,8 @@ The full guide — every global, agent option, `agentType` definitions, structur
 | `phase(title, { budget? })` | Group agents in the live view; optional per-phase token sub-budget. |
 | `verify` / `judgePanel` / `loopUntilDry` / `completenessCheck` | Built-in quality patterns. |
 | `workflow(nameOrSourceOrDescriptor, args)` | Run a saved name, raw source string, or `{ scriptPath: "child.js" }` inline (shares global caps). |
+
+The top-level `workflow` tool accepts exactly one of `script` (raw source) or `scriptPath` (a file rooted at the tool context `ctx.cwd`). Script paths are read fresh for every call and must resolve to a regular file contained by the realpath of `ctx.cwd`; missing files, directories, traversal, and symlink escapes are rejected. The supplied `args` value is passed unchanged to foreground and background runs.
 | `checkpoint(prompt, opts)` | A journaled, replayable human approval gate. |
 | `budget` | `{ total, spent(), remaining() }` real-token tracker. |
 

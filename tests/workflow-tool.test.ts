@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, relative } from "node:path";
 import test from "node:test";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { backgroundStartedText, createWorkflowTool, modelRoutingGuideline } from "../src/workflow-tool.js";
@@ -25,6 +28,94 @@ test("backgroundStartedText tells the user it auto-continues and they can wait",
 });
 
 // ─── createWorkflowTool ────────────────────────────────────────────────────────
+
+test("workflow tool accepts exactly one fresh, cwd-contained scriptPath source", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-dw-tool-"));
+  const outside = mkdtempSync(join(tmpdir(), "pi-dw-tool-outside-"));
+  try {
+    const script = "export const meta = { name: 'path-workflow', description: 'path workflow' }\nreturn args";
+    const scriptPath = join(root, "workflow.js");
+    writeFileSync(scriptPath, script);
+    const captured: Array<{ script: string; args: unknown }> = [];
+    const manager = {
+      getModelRegistry: () => undefined,
+      startInBackground(source: string, args: unknown) {
+        captured.push({ script: source, args });
+        return { runId: "run-path", promise: Promise.resolve({}) };
+      },
+    } as any;
+    const tool = createWorkflowTool({ cwd: root, manager });
+    const execute = tool.execute as any;
+
+    await execute("call", { scriptPath: "workflow.js", args: { fresh: true } }, undefined, undefined, { cwd: root });
+    assert.deepEqual(captured, [{ script, args: { fresh: true } }]);
+    writeFileSync(scriptPath, script.replace("path-workflow", "updated-workflow"));
+    await execute("call", { scriptPath: "workflow.js", args: { fresh: false } }, undefined, undefined, { cwd: root });
+    assert.equal(captured[1]?.script, script.replace("path-workflow", "updated-workflow"));
+
+    const outsidePath = join(outside, "outside.js");
+    writeFileSync(outsidePath, script);
+    const invalid = [
+      [{ script: script, scriptPath: "workflow.js" }, /exactly one/],
+      [{}, /exactly one/],
+      [{ scriptPath: "   " }, /non-empty/],
+      [{ scriptPath: "missing.js" }, /does not exist/],
+      [{ scriptPath: relative(root, outsidePath) }, /escapes workflow cwd/],
+    ] as const;
+    for (const [params, message] of invalid) {
+      await assert.rejects(() => execute("call", params, undefined, undefined, { cwd: root }), message);
+    }
+
+    mkdirSync(join(root, "directory"));
+    await assert.rejects(
+      () => execute("call", { scriptPath: "directory" }, undefined, undefined, { cwd: root }),
+      /must reference a file/,
+    );
+    symlinkSync(outsidePath, join(root, "linked.js"));
+    await assert.rejects(
+      () => execute("call", { scriptPath: "linked.js" }, undefined, undefined, { cwd: root }),
+      /escapes workflow cwd/,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("workflow tool passes exact scriptPath source and args to foreground manager.runSync", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-dw-tool-foreground-"));
+  try {
+    const script =
+      "export const meta = { name: 'foreground-path', description: 'foreground path' }\n" +
+      "await agent('preserve this source')\n  \n";
+    writeFileSync(join(root, "workflow.js"), script);
+    const args = { unchanged: true, nested: { value: "keep" } };
+    const calls: Array<{ script: string; args: unknown }> = [];
+    const manager = {
+      getModelRegistry: () => undefined,
+      runSync(source: string, receivedArgs: unknown) {
+        calls.push({ script: source, args: receivedArgs });
+        return Promise.resolve({
+          meta: { name: "foreground-path", description: "foreground path" },
+          result: { ok: true },
+          logs: [],
+          phases: [],
+          agentCount: 1,
+          durationMs: 1,
+        });
+      },
+    } as any;
+    const tool = createWorkflowTool({ cwd: root, manager });
+
+    await (tool.execute as any)("call", { scriptPath: "workflow.js", args, background: false }, undefined, undefined, {
+      cwd: root,
+    });
+
+    assert.deepEqual(calls, [{ script, args }]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("createWorkflowTool has correct name and label", () => {
   const tool = createWorkflowTool();
