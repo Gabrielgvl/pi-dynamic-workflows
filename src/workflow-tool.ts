@@ -2,6 +2,7 @@ import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { listAgentTypes, loadAgentRegistry } from "./agent-registry.js";
+import { MAX_AGENTS_PER_RUN, normalizeMaxAgents } from "./config.js";
 import {
   createToolUpdateWorkflowDisplay,
   createWorkflowSnapshot,
@@ -14,7 +15,9 @@ import {
   type WorkflowSnapshot,
 } from "./display.js";
 import { WorkflowError, WorkflowErrorCode } from "./errors.js";
-import { parseWorkflowScript, type WorkflowRunResult } from "./workflow.js";
+import { normalizeJsonTree } from "./json-value.js";
+import { assertValidRunId } from "./run-persistence.js";
+import { parseWorkflowScript, resolveWorkflowScriptPath, type WorkflowRunResult } from "./workflow.js";
 import { WorkflowManager } from "./workflow-manager.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
 import { loadWorkflowSettings } from "./workflow-settings.js";
@@ -58,25 +61,39 @@ export function agentTypeGuideline(cwd: string = process.cwd()): string | undefi
 }
 
 const workflowToolSchema = Type.Object({
-  script: Type.String({
-    description: [
-      "Required raw JavaScript workflow script, with no Markdown fences.",
-      "First statement: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{ title: 'Phase' }] }",
-      "Use phase('Name'), agent(prompt, opts), parallel(arrayOfFunctions), pipeline(items, ...stages), log(message), args, and budget. The workflow must call agent() at least once.",
-      "parallel() requires functions, not promises: await parallel(items.map(item => () => agent(...))).",
-    ].join(" "),
-  }),
+  action: Type.Optional(
+    Type.Union([Type.Literal("run"), Type.Literal("resume"), Type.Literal("status")], {
+      description: "run starts (default), resume continues, status inspects.",
+    }),
+  ),
+  runId: Type.Optional(
+    Type.String({
+      description: "Run ID for resume and status.",
+    }),
+  ),
+  script: Type.Optional(
+    Type.String({
+      description:
+        "Raw JavaScript workflow source (no fences). Provide exactly one of script/scriptPath. First statement exports meta with name and description; the workflow must call agent() at least once.",
+    }),
+  ),
+  scriptPath: Type.Optional(
+    Type.String({
+      description: "Path to a workflow script, rooted at ctx.cwd. Provide exactly one of script or scriptPath.",
+    }),
+  ),
   args: Type.Optional(
     Type.Any({ description: "Optional JSON value exposed to the workflow script as global `args`." }),
   ),
   background: Type.Optional(
     Type.Boolean({
-      description:
-        "Run the workflow in the background. Default: true — the tool returns immediately with a run ID, the turn ends so the user isn't blocked, and the result is delivered back into the conversation when it finishes. Set to false only when you need the result inline in this same turn (the call will block until the workflow completes).",
+      description: "Background by default; false blocks and returns the result inline.",
     }),
   ),
   maxAgents: Type.Optional(
-    Type.Number({
+    Type.Integer({
+      minimum: 1,
+      maximum: MAX_AGENTS_PER_RUN,
       description: "Maximum number of agents allowed in this run. Default: 1000.",
     }),
   ),
@@ -106,17 +123,17 @@ const workflowToolSchema = Type.Object({
   ),
   resumeFromRunId: Type.Optional(
     Type.String({
-      description: [
-        "Resume a prior run (this ID) with an edited `script` instead of starting a new run.",
-        "Unchanged agent() calls replay from that run's cache; the first changed/new call onward re-runs.",
-        "Calls match by position: keep earlier good calls identical and in order. Always background.",
-      ].join(" "),
+      description:
+        "Edit-resume this run ID: unchanged positional agent calls replay; changed/new calls rerun. Background only.",
     }),
   ),
 });
 
 export type WorkflowToolInput = {
-  script: string;
+  action?: "run" | "resume" | "status";
+  runId?: string;
+  script?: string;
+  scriptPath?: string;
   args?: unknown;
   background?: boolean;
   maxAgents?: number;
@@ -154,23 +171,23 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       loadSavedWorkflow: (name: string) => storage.load(name)?.script,
       defaultAgentTimeoutMs: defaults.agentTimeoutMs,
       defaultAgentRetries: defaults.agentRetries,
+      modelAliases: defaults.modelAliases,
+      strictModelResolution: defaults.strictModelResolution,
     });
 
   return defineTool({
     name: "workflow",
     label: "Workflow",
-    description: [
-      "Execute a deterministic JavaScript workflow that orchestrates multiple subagents with agent(), parallel(), and pipeline().",
-      "script is required raw JavaScript. It must start with export const meta = { name, description, phases? } and must call agent() at least once.",
-    ].join(" "),
-    promptSnippet:
-      "Run a deterministic JavaScript workflow. Required script header: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{ title: 'Phase' }] }.",
+    description:
+      "Run, resume, or inspect a deterministic JavaScript workflow that orchestrates subagents with agent(), parallel(), and pipeline().",
+    promptSnippet: "workflow agents.",
     // Lazy accessor: the SDK re-reads definition.promptGuidelines on every
     // tool-registry refresh, so changes to the agentType registry are reflected.
     get promptGuidelines() {
       return [
         "Use workflow only when the user explicitly asks for a workflow, workflows, fan-out, or multi-agent orchestration.",
-        "For workflow, always pass one raw JavaScript string in the required script parameter; do not include Markdown fences or prose around the script.",
+        "For workflow actions: run needs script or scriptPath; resume needs runId and optional args patch; status needs runId.",
+        "For workflow, raw script must not include Markdown fences or prose around it; scriptPath is read fresh for each call and must be a file inside ctx.cwd (no traversal or symlink escapes).",
         "For workflow, the script's first statement must be `export const meta = { name: 'short_snake_case', description: 'non-empty human description', phases: [{ title: 'Phase name' }] }`; meta.name and meta.description are required non-empty strings.",
         "For workflow, write plain JavaScript after the meta export. Do not use TypeScript syntax, imports, require(), fs, Date.now(), Math.random(), or new Date().",
         "For workflow, available globals are agent(prompt, opts), parallel(thunks), pipeline(items, ...stages), phase(title), log(message), args, cwd, process.cwd(), and budget. Every workflow must call agent() at least once; do not use workflow only to declare phases or return a static object.",
@@ -187,7 +204,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         "For workflow, include a final synthesis/assertion agent when combining multiple subagent results; return a compact JSON-serializable value with ok/verdict plus the important outputs.",
         "For workflow, the default quality shape for fan-out work is finder -> verify -> merge: run one agent per angle or work-unit (in parallel), pass each candidate finding through verify() and drop the unconfirmed, then a single synthesis agent that de-duplicates, ranks by confidence/severity, and caps the output. If nothing survives verification, return an empty result and say so rather than padding.",
         "For workflow, give each subagent a substantive, self-contained task: do not spawn an agent just to read one file or run one command, and do not use one agent only to check on another. Prefer fewer, higher-level agents over many trivial micro-tasks.",
-        "For workflow, if agent() needs machine-readable output, pass a plain JSON Schema via opts.schema; agent() will return the validated object. Use JSON Schema syntax, not TypeScript or TypeBox constructors.",
+        "For workflow structured output, opts.schema supports only the literal TypeBox-compatible subset: type, properties, required, additionalProperties, items, enum, description. TypeBox constructors are API-only.",
         modelRoutingGuideline(),
         agentTypeGuideline(),
         "For workflow, do not assume the parent assistant has repository code context inside subagents; include enough task context and relevant paths in each agent prompt.",
@@ -200,7 +217,45 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       return normalizeWorkflowToolArgs(args);
     },
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const script = normalizeWorkflowScript(params.script);
+      const executionCwd = (ctx as { cwd?: string } | undefined)?.cwd ?? cwd;
+      const normalized = normalizeWorkflowToolArgs(params);
+
+      if (normalized.action === "status") {
+        const details = workflowRunStatus(manager, normalized.runId as string);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Workflow **${details.workflowName}** run \`${details.runId}\` is **${details.status}**${
+                details.currentPhase ? ` in phase **${details.currentPhase}**` : ""
+              } (${details.agentCount} agent(s)).`,
+            },
+          ],
+          details,
+        };
+      }
+
+      if (normalized.action === "resume") {
+        const runId = normalized.runId as string;
+        const resumed = Object.hasOwn(normalized, "args")
+          ? await manager.resume(runId, { argsPatch: normalized.args as Record<string, unknown> })
+          : await manager.resume(runId);
+        if (!resumed) {
+          const status = manager.getRunForReport(runId)?.status ?? "not found";
+          throw new Error(`Workflow run ${runId} is not resumable (status: ${status})`);
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Workflow run \`${runId}\` resumed in the background. Its result will be delivered when it finishes.`,
+            },
+          ],
+          details: { runId, background: true, resumed: true },
+        };
+      }
+
+      const script = resolveWorkflowToolSource(normalized, executionCwd);
       const parsed = parseWorkflowScript(script);
 
       // Iteration / cached-prefix reuse: resume a prior run with THIS (edited)
@@ -210,7 +265,8 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       // detached and its result is delivered back into the conversation).
       if (params.resumeFromRunId) {
         const runId = params.resumeFromRunId;
-        const resumed = await manager.resume(runId, { script, args: params.args });
+        const resumeOptions = Object.hasOwn(params, "args") ? { script, args: params.args } : { script };
+        const resumed = await manager.resume(runId, resumeOptions);
         if (!resumed) {
           throw new Error(resumeFailureText(manager, runId));
         }
@@ -242,6 +298,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           agentRetries: params.agentRetries,
           agentTimeoutMs: params.agentTimeoutMs,
           tokenBudget: params.tokenBudget,
+          cwd: executionCwd,
         });
         return {
           content: [{ type: "text", text: backgroundStartedText(parsed.meta.name, runId) }],
@@ -269,6 +326,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           agentRetries: params.agentRetries,
           agentTimeoutMs: params.agentTimeoutMs,
           tokenBudget: params.tokenBudget,
+          cwd: executionCwd,
           confirm,
           externalSignal: signal,
           onProgress(live) {
@@ -357,7 +415,13 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
 function resolveWorkflowToolDefaults(
   options: WorkflowToolOptions,
   cwd: string,
-): { agentTimeoutMs: number | null; concurrency?: number; agentRetries: number } {
+): {
+  agentTimeoutMs: number | null;
+  concurrency?: number;
+  agentRetries: number;
+  modelAliases?: Record<string, string>;
+  strictModelResolution?: boolean;
+} {
   const settings = loadWorkflowSettings({ cwd });
   return {
     agentTimeoutMs:
@@ -366,6 +430,8 @@ function resolveWorkflowToolDefaults(
         : (settings.defaultAgentTimeoutMs ?? null),
     concurrency: options.defaultConcurrency ?? options.concurrency ?? settings.defaultConcurrency,
     agentRetries: options.defaultAgentRetries ?? settings.defaultAgentRetries ?? 0,
+    modelAliases: settings.modelAliases,
+    strictModelResolution: settings.strictModelResolution,
   };
 }
 
@@ -389,21 +455,12 @@ export function backgroundStartedText(name: string, runId: string): string {
   ].join("\n");
 }
 
-/**
- * One-line hint telling the model it can iterate on a finished/running run by
- * resuming it with an edited script instead of re-running the whole workflow.
- * Unchanged agent() calls replay from the journal (cache); only edited/new ones
- * re-run. Omitted when there is no runId to reference.
- */
+/** Hint that a run can be resumed with an edited script and cached prefix. */
 export function reviseHint(runId: string | undefined): string {
   if (!runId) return "";
   return `To revise without re-running everything: re-call workflow with resumeFromRunId="${runId}" and an edited script — unchanged agent() calls replay from cache, only edited/new ones re-run.`;
 }
 
-/**
- * The tool result returned when the model resumes a run with an edited script.
- * The resumed run is always background, so its result is delivered back later.
- */
 export function resumedText(name: string, runId: string): string {
   return [
     `Workflow "${name}" resumed from run ${runId} with your edited script.`,
@@ -415,12 +472,8 @@ export function resumedText(name: string, runId: string): string {
   ].join("\n");
 }
 
-/**
- * Explain why a resumeFromRunId could not be resumed, so the model gets a clear
- * tool error instead of a silent failure. Inspects live + persisted state to
- * name the concrete reason (not found / running / completed / stopped).
- */
 export function resumeFailureText(manager: WorkflowManager, runId: string): string {
+  assertValidRunId(runId);
   const active = manager.getRun(runId);
   if (active?.status === "running") {
     return `Cannot resume workflow run "${runId}": it is still running. Wait for it to finish (or /workflows stop ${runId}) before resuming with an edited script.`;
@@ -441,11 +494,90 @@ export function resumeFailureText(manager: WorkflowManager, runId: string): stri
   return `Cannot resume workflow run "${runId}": it is not currently resumable (it may be busy under another process). Try again shortly, or start a new run.`;
 }
 
+function workflowRunStatus(manager: WorkflowManager, runId: string) {
+  assertValidRunId(runId);
+  const persisted = manager.getRunForReport(runId);
+  const active = typeof manager.getRun === "function" ? manager.getRun(runId) : undefined;
+  if (!persisted && !active) throw new Error(`Workflow run ${runId} was not found`);
+  return {
+    runId,
+    workflowName: active?.snapshot.name ?? persisted?.workflowName ?? "workflow",
+    status: active?.status ?? persisted?.status ?? "unknown",
+    currentPhase: active?.snapshot.currentPhase ?? persisted?.currentPhase,
+    phases: active?.snapshot.phases ?? persisted?.phases ?? [],
+    agentCount: active?.snapshot.agents.length ?? persisted?.agents?.length ?? 0,
+    startedAt: active?.startedAt.toISOString() ?? persisted?.startedAt,
+    updatedAt: persisted?.updatedAt,
+  };
+}
+
 function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {
-  if (!args || typeof args !== "object") throw new Error("workflow requires an object argument with a script string");
+  if (!args || typeof args !== "object") throw new Error("workflow requires an object argument");
   const value = args as Record<string, unknown>;
-  if (typeof value.script !== "string") throw new Error("workflow requires `script` to be a string");
-  return { ...value, script: normalizeWorkflowScript(value.script) } as WorkflowToolInput;
+  const action = value.action ?? "run";
+  if (action !== "run" && action !== "resume" && action !== "status") {
+    throw new Error("workflow `action` must be run, resume, or status");
+  }
+
+  const hasScript = Object.hasOwn(value, "script");
+  const hasScriptPath = Object.hasOwn(value, "scriptPath");
+  const hasRunId = Object.hasOwn(value, "runId");
+
+  if (action === "run") {
+    if (hasRunId) throw new Error("workflow action=run must not include `runId`");
+    if (hasScript === hasScriptPath) throw new Error("workflow requires exactly one of `script` or `scriptPath`");
+    if (hasScript && typeof value.script !== "string") throw new Error("workflow `script` must be a string");
+    if (hasScriptPath && (typeof value.scriptPath !== "string" || value.scriptPath.trim().length === 0)) {
+      throw new Error("workflow `scriptPath` must be a non-empty string");
+    }
+    if (value.resumeFromRunId !== undefined) {
+      if (typeof value.resumeFromRunId !== "string") throw new Error("workflow `resumeFromRunId` must be a string");
+      assertValidRunId(value.resumeFromRunId);
+    }
+    return {
+      ...value,
+      ...(hasScript ? { script: normalizeWorkflowScript(value.script as string) } : {}),
+      ...(Object.hasOwn(value, "args") ? { args: normalizeWorkflowArgs(value.args) } : {}),
+      ...(Object.hasOwn(value, "maxAgents") ? { maxAgents: normalizeMaxAgents(value.maxAgents) } : {}),
+    } as WorkflowToolInput;
+  }
+
+  if (hasScript || hasScriptPath) {
+    throw new Error(`workflow action=${action} must not include \`script\` or \`scriptPath\``);
+  }
+  if (!hasRunId || typeof value.runId !== "string" || value.runId.trim().length === 0) {
+    throw new Error(`workflow action=${action} requires a non-empty \`runId\``);
+  }
+  if (action === "status" && Object.hasOwn(value, "args")) {
+    throw new Error("workflow action=status must not include `args`");
+  }
+  const runOnly = ["background", "maxAgents", "concurrency", "agentRetries", "agentTimeoutMs", "tokenBudget"];
+  const invalid = runOnly.find((key) => Object.hasOwn(value, key));
+  if (invalid) throw new Error(`workflow action=${action} must not include run-only \`${invalid}\``);
+
+  const runId = value.runId.trim();
+  assertValidRunId(runId);
+  return {
+    ...value,
+    action,
+    runId,
+    ...(Object.hasOwn(value, "args") ? { args: normalizeWorkflowArgs(value.args) } : {}),
+  } as WorkflowToolInput;
+}
+
+function normalizeWorkflowArgs(args: unknown): unknown {
+  if (args === undefined) return undefined;
+  try {
+    return normalizeJsonTree(args);
+  } catch {
+    throw new Error("workflow `args` must contain only deterministic JSON values");
+  }
+}
+
+function resolveWorkflowToolSource(params: WorkflowToolInput, cwd: string): string {
+  const normalized = normalizeWorkflowToolArgs(params);
+  if (normalized.script !== undefined) return normalized.script;
+  return resolveWorkflowScriptPath(normalized.scriptPath as string, cwd).script;
 }
 
 function normalizeWorkflowScript(script: string): string {

@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
+import { SharedStore } from "../src/shared-store.js";
 import { type JournalEntry, runWorkflow } from "../src/workflow.js";
+import { WorkflowManager } from "../src/workflow-manager.js";
+import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 /** Agent runner that counts real invocations and echoes a per-call result. */
 function countingAgent() {
@@ -48,6 +54,282 @@ function createDeferred<T = void>(): { promise: Promise<T>; resolve: (value: T |
   });
   return { promise, resolve };
 }
+
+test("a parent-aborted settled attempt persists finalized usage exactly once before cancellation", async () => {
+  const controller = new AbortController();
+  const started = createDeferred<void>();
+  const progress: AgentUsage[] = [];
+  let finalUsageEvents = 0;
+  const run = runWorkflow(
+    `export const meta = { name: 'abort-usage', description: 'abort usage' }
+return await agent('work')`,
+    {
+      persistLogs: false,
+      signal: controller.signal,
+      onTokenUsageProgress: (usage) => progress.push(usage as AgentUsage),
+      onTokenUsage: () => finalUsageEvents++,
+      agent: {
+        async run(_prompt: string, options: { signal?: AbortSignal; onUsage?: (usage: AgentUsage) => void }) {
+          started.resolve();
+          await new Promise<void>((resolve) =>
+            options.signal?.addEventListener("abort", () => resolve(), { once: true }),
+          );
+          options.onUsage?.({ input: 7, output: 4, cacheRead: 0, cacheWrite: 0, total: 11, cost: 0.01 });
+          return "settled-after-abort";
+        },
+      },
+    },
+  );
+
+  await started.promise;
+  controller.abort();
+  await assert.rejects(run, (error: unknown) => {
+    assert.ok(error instanceof WorkflowError);
+    assert.equal(error.code, WorkflowErrorCode.WORKFLOW_ABORTED);
+    return true;
+  });
+  assert.deepEqual(
+    progress.map((usage) => usage.total),
+    [11],
+  );
+  assert.equal(finalUsageEvents, 0, "public usage remains final-success-only");
+});
+
+test("parallel cancellation is operation-scoped, awaits siblings, and permits later workflow work", async () => {
+  let siblingSettled = false;
+  const started = createDeferred<void>();
+  const script = `export const meta = { name: 'parallel-cancel', description: 'parallel cancellation' }
+let caught = ''
+try {
+  await parallel([
+    () => agent('fatal'),
+    () => agent('sibling'),
+  ])
+} catch (error) {
+  caught = error.message
+}
+const after = await agent('after')
+return { caught, after }`;
+
+  const result = await runWorkflow(script, {
+    persistLogs: false,
+    agent: {
+      async run(prompt: string, options: { signal?: AbortSignal }) {
+        if (prompt === "fatal") {
+          await started.promise;
+          throw new WorkflowError("fatal", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, { recoverable: false });
+        }
+        if (prompt === "after") {
+          assert.equal(siblingSettled, true, "parallel must await sibling cleanup before returning");
+          return "continued";
+        }
+        started.resolve();
+        await new Promise<void>((resolve) =>
+          options.signal?.addEventListener("abort", () => resolve(), { once: true }),
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        siblingSettled = true;
+        throw new Error("cancelled sibling");
+      },
+    },
+  });
+
+  assert.equal(JSON.stringify(result.result), JSON.stringify({ caught: "fatal", after: "continued" }));
+  assert.equal(siblingSettled, true);
+});
+
+test("pipeline cancellation is operation-scoped, awaits siblings, and permits later workflow work", async () => {
+  let siblingSettled = false;
+  const started = createDeferred<void>();
+  const script = `export const meta = { name: 'pipeline-cancel', description: 'pipeline cancellation' }
+let caught = ''
+try {
+  await pipeline(['fatal', 'sibling'], item => agent(item))
+} catch (error) {
+  caught = error.message
+}
+const after = await agent('after')
+return { caught, after }`;
+
+  const result = await runWorkflow(script, {
+    persistLogs: false,
+    agent: {
+      async run(prompt: string, options: { signal?: AbortSignal }) {
+        if (prompt === "fatal") {
+          await started.promise;
+          throw new WorkflowError("fatal", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, { recoverable: false });
+        }
+        if (prompt === "after") {
+          assert.equal(siblingSettled, true, "pipeline must await sibling cleanup before returning");
+          return "continued";
+        }
+        started.resolve();
+        await new Promise<void>((resolve) =>
+          options.signal?.addEventListener("abort", () => resolve(), { once: true }),
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        siblingSettled = true;
+        throw new Error("cancelled sibling");
+      },
+    },
+  });
+
+  assert.equal(JSON.stringify(result.result), JSON.stringify({ caught: "fatal", after: "continued" }));
+  assert.equal(siblingSettled, true);
+});
+
+for (const operation of ["parallel", "pipeline"] as const) {
+  test(`${operation} cancellation aborts and settles agents inside nested workflow() siblings`, async () => {
+    let childAborted = false;
+    const ended: Array<{ label: string; errorCode?: WorkflowErrorCode }> = [];
+    const childStarted = createDeferred<void>();
+    const releaseChild = createDeferred<void>();
+    const child = `export const meta = { name: 'child', description: 'child' }
+return await agent('nested sibling', { label: 'nested' })`;
+    const operationCall =
+      operation === "parallel"
+        ? "parallel([() => agent('fatal', { label: 'fatal' }), () => workflow('child')])"
+        : "pipeline(['fatal', 'child'], item => item === 'fatal' ? agent(item, { label: 'fatal' }) : workflow(item))";
+    const parent = `export const meta = { name: 'nested-cancel', description: 'nested cancellation' }
+let caught = ''
+try {
+  await ${operationCall}
+} catch (error) {
+  caught = error.message
+}
+const after = await agent('after', { label: 'after' })
+return { caught, after }`;
+
+    const run = runWorkflow<{ caught: string; after: string }>(parent, {
+      persistLogs: false,
+      loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
+      onAgentEnd: (event) => ended.push({ label: event.label, errorCode: event.errorCode }),
+      agent: {
+        async run(prompt: string, options: { signal?: AbortSignal }) {
+          if (prompt === "fatal") {
+            await childStarted.promise;
+            throw new WorkflowError("fatal", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, { recoverable: false });
+          }
+          if (prompt === "after") return "continued";
+          childStarted.resolve();
+          const outcome = await Promise.race([
+            new Promise<"aborted">((resolve) =>
+              options.signal?.addEventListener("abort", () => resolve("aborted"), { once: true }),
+            ),
+            releaseChild.promise.then(() => "released" as const),
+          ]);
+          if (outcome === "aborted") {
+            childAborted = true;
+            throw new Error("nested sibling cancelled");
+          }
+          return "nested sibling escaped cancellation";
+        },
+      },
+    });
+
+    await childStarted.promise;
+    setImmediate(() => releaseChild.resolve());
+    const result = await run;
+    assert.equal(result.result.caught, "fatal");
+    assert.equal(result.result.after, "continued", "caught operation cancellation must not abort the parent run");
+    assert.equal(childAborted, true, "operation cancellation must reach the nested child agent");
+    assert.equal(
+      ended.find((event) => event.label === "nested")?.errorCode,
+      WorkflowErrorCode.WORKFLOW_ABORTED,
+      "the cancelled nested agent must emit a terminal error event",
+    );
+  });
+}
+
+test("runWorkflow rejects unsafe explicit run IDs before creating logger paths", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-run-id-cwd-"));
+  const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-run-id-home-"));
+  try {
+    await withFakeHomeAsync(fakeHome, async () => {
+      await assert.rejects(
+        runWorkflow(`export const meta = { name: 'unsafe-id', description: 'unsafe id' }\nreturn 'ok'`, {
+          cwd,
+          runId: "../../escaped",
+        }),
+        /Invalid workflow run ID/,
+      );
+      assert.equal(existsSync(join(fakeHome, ".pi")), false, "validation must happen before logger directories exist");
+    });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(fakeHome, { recursive: true, force: true });
+  }
+});
+
+test("nested child run IDs stay safe and unique when the parent run ID is at the 128-character limit", async () => {
+  const parentRunId = `p${"a".repeat(127)}`;
+  const sessionNames: string[] = [];
+  const child = `export const meta = { name: 'child', description: 'child' }
+return await agent('child work')`;
+  const parent = `export const meta = { name: 'parent', description: 'parent' }
+return await parallel([
+  () => workflow('child', { index: 0 }),
+  () => workflow('child', { index: 1 }),
+])`;
+
+  const execute = async () => {
+    const start = sessionNames.length;
+    await runWorkflow(parent, {
+      runId: parentRunId,
+      persistLogs: false,
+      loadSavedWorkflow: () => child,
+      agent: {
+        async run(_prompt: string, options: { sessionName?: string }) {
+          if (options.sessionName) sessionNames.push(options.sessionName);
+          return "ok";
+        },
+      },
+    });
+    return sessionNames
+      .slice(start)
+      .map((name) => name.slice("workflow:".length, name.indexOf(" ")))
+      .sort();
+  };
+
+  const childRunIds = await execute();
+  assert.equal(childRunIds.length, 2);
+  assert.equal(new Set(childRunIds).size, 2, "concurrent child invocations must retain distinct run IDs");
+  assert.deepEqual(await execute(), childRunIds, "the truncation/hash suffix must be deterministic");
+  for (const childRunId of childRunIds) {
+    assert.ok(childRunId.length <= 128, `child run ID exceeded 128 characters: ${childRunId.length}`);
+    assert.match(childRunId, /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/);
+  }
+});
+
+test("nested workflow scriptPath rejects symlinks with SCRIPT_VALIDATION_ERROR", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-dw-nested-script-path-"));
+  try {
+    const childPath = join(root, "child.js");
+    writeFileSync(
+      childPath,
+      "export const meta = { name: 'child', description: 'child' }\nreturn await agent('child')",
+    );
+    symlinkSync(childPath, join(root, "child-link.js"));
+    const parent = `export const meta = { name: 'parent', description: 'parent' }
+return await workflow({ scriptPath: 'child-link.js' })`;
+
+    await assert.rejects(
+      runWorkflow(parent, {
+        cwd: root,
+        persistLogs: false,
+        agent: countingAgent().runner,
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof WorkflowError);
+        assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+        assert.match(error.message, /symlink/);
+        return true;
+      },
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("runWorkflow concurrency caps parallel agents", async () => {
   let active = 0;
@@ -339,6 +621,148 @@ const a = await agent('first', { label: 'a' })
 const b = await agent('second', { label: 'b' })
 return { a, b }`;
 
+test("structured agent results and replay are independent deterministic JSON snapshots", async () => {
+  const shared = { count: 1 };
+  const agentResult = { first: shared, second: shared };
+  const journal: JournalEntry[] = [];
+  const script = `export const meta = { name: 'structured_snapshot', description: 'snapshot isolation' }
+const value = await agent('structured', {
+  schema: {
+    type: 'object',
+    properties: {
+      first: { type: 'object', properties: { count: { type: 'number' } }, required: ['count'] },
+      second: { type: 'object', properties: { count: { type: 'number' } }, required: ['count'] },
+    },
+    required: ['first', 'second'],
+  },
+})
+value.first.count = 9
+return value`;
+
+  const live = await runWorkflow<{ first: { count: number }; second: { count: number } }>(script, {
+    agent: {
+      async run() {
+        return agentResult;
+      },
+    },
+    persistLogs: false,
+    onAgentJournal: (entry) => journal.push(entry),
+  });
+
+  assert.deepEqual(live.result, { first: { count: 9 }, second: { count: 1 } });
+  assert.deepEqual(journal[0].result, { first: { count: 1 }, second: { count: 1 } });
+  assert.deepEqual(agentResult, { first: { count: 1 }, second: { count: 1 } });
+
+  const replay = await runWorkflow<{ first: { count: number }; second: { count: number } }>(script, {
+    agent: {
+      async run() {
+        throw new Error("must not rerun");
+      },
+    },
+    persistLogs: false,
+    resumeJournal: new Map(journal.map((entry) => [entry.index, entry])),
+  });
+
+  assert.deepEqual(replay.result, { first: { count: 9 }, second: { count: 1 } });
+  assert.deepEqual(journal[0].result, { first: { count: 1 }, second: { count: 1 } });
+});
+
+test("throwing onAgentEnd diagnostics do not retry or invalidate journaled store writes", async () => {
+  const store = new SharedStore();
+  const journal: JournalEntry[] = [];
+  let calls = 0;
+  const result = await runWorkflow<string>(
+    `export const meta = { name: 'diagnostic-hook', description: 'best effort hook' }
+return await agent('write')`,
+    {
+      agentRetries: 2,
+      persistLogs: false,
+      sharedStore: store,
+      onAgentJournal: (entry) => journal.push(entry),
+      onAgentEnd: () => {
+        throw new Error("diagnostic listener failed");
+      },
+      agent: {
+        async run(_prompt, options) {
+          calls++;
+          await options.systemTools
+            ?.find((tool) => tool.name === "store_put")
+            ?.execute("", {
+              key: "committed",
+              value: "kept",
+            });
+          return "done";
+        },
+      },
+    },
+  );
+
+  assert.equal(result.result, "done");
+  assert.equal(calls, 1);
+  assert.equal(journal.length, 1);
+  assert.equal(store.get("committed"), "kept");
+});
+
+test("throwing final token diagnostics do not invalidate journaled success", async () => {
+  const journal: JournalEntry[] = [];
+  const result = await runWorkflow<string>(
+    `export const meta = { name: 'token-hook', description: 'best effort final hook' }
+return await agent('done')`,
+    {
+      agent: countingAgent().runner,
+      persistLogs: false,
+      onAgentJournal: (entry) => journal.push(entry),
+      onTokenUsage: () => {
+        throw new Error("token listener failed");
+      },
+    },
+  );
+
+  assert.equal(result.result, "ran:done");
+  assert.equal(journal.length, 1);
+});
+
+test("structured agent results reject unsupported non-JSON values before journaling", async () => {
+  const journal: JournalEntry[] = [];
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'structured_invalid', description: 'invalid snapshot' }
+return await agent('structured', { schema: { type: 'object' } })`,
+        {
+          agent: {
+            async run() {
+              return { createdAt: new Date(0) };
+            },
+          },
+          persistLogs: false,
+          onAgentJournal: (entry) => journal.push(entry),
+        },
+      ),
+    /structured agent result.*deterministic JSON/i,
+  );
+  assert.equal(journal.length, 0);
+});
+
+test("structured string schema results preserve string semantics", async () => {
+  const journal: JournalEntry[] = [];
+  const result = await runWorkflow<string>(
+    `export const meta = { name: 'structured_string', description: 'string result' }
+return await agent('structured', { schema: { type: 'string' } })`,
+    {
+      agent: {
+        async run() {
+          return "exact string";
+        },
+      },
+      persistLogs: false,
+      onAgentJournal: (entry) => journal.push(entry),
+    },
+  );
+  assert.equal(result.result, "exact string");
+  assert.equal(journal[0].result, "exact string");
+});
+
 test("resume replays cached results without re-running agents", async () => {
   const first = countingAgent();
   const journal: JournalEntry[] = [];
@@ -473,6 +897,33 @@ return { a, nested }`;
 
   assert.equal(result.agentCount, 2);
   assert.equal(result.result.nested.child, "ran:child task");
+});
+
+test("concurrent sibling workflow() calls have invocation-local nesting depth", async () => {
+  const release = createDeferred<void>();
+  const started = new Set<string>();
+  const child = `export const meta = { name: 'child', description: 'c' }
+return await agent(args.name, { label: args.name })`;
+  const parent = `export const meta = { name: 'parent', description: 'p' }
+return await parallel(['left', 'right'].map(name => () => workflow('child', { name })))`;
+
+  const resultPromise = runWorkflow<string[]>(parent, {
+    persistLogs: false,
+    concurrency: 2,
+    loadSavedWorkflow: () => child,
+    agent: {
+      async run(prompt: string) {
+        started.add(prompt);
+        if (started.size === 1) setImmediate(() => release.resolve());
+        await release.promise;
+        return `ran:${prompt}`;
+      },
+    },
+  });
+
+  const result = await resultPromise;
+  assert.deepEqual(result.result, ["ran:left", "ran:right"]);
+  assert.equal(result.agentCount, 2, "global agent accounting remains shared across sibling child invocations");
 });
 
 test("workflow() nesting is one level deep (second level throws)", async () => {
@@ -744,15 +1195,79 @@ return true`;
 
 test("runWorkflow process.cwd() works inside script", async () => {
   const script = `export const meta = { name: 'cwd_test', description: 'cwd' }
-return { cwd: process.cwd() }`;
+return { cwd, processCwd: process.cwd() }`;
 
-  const result = await runWorkflow<{ cwd: string }>(script, {
-    agent: countingAgent().runner,
-    persistLogs: false,
-  });
+  const relativeCwd = mkdtempSync(join(tmpdir(), "pi-dw-canonical-cwd-"));
+  try {
+    const result = await runWorkflow<{ cwd: string; processCwd: string }>(script, {
+      cwd: relativeCwd,
+      agent: countingAgent().runner,
+      persistLogs: false,
+    });
 
-  assert.equal(typeof result.result.cwd, "string");
-  assert.ok(result.result.cwd.length > 0, "result.cwd should not be empty");
+    assert.equal(result.result.cwd, relativeCwd);
+    assert.equal(result.result.processCwd, relativeCwd);
+  } finally {
+    rmSync(relativeCwd, { recursive: true, force: true });
+  }
+});
+
+test("runWorkflow rejects a missing cwd as a workflow validation error before executing", async () => {
+  const missing = join(tmpdir(), `pi-dw-missing-cwd-${process.pid}`);
+  rmSync(missing, { recursive: true, force: true });
+  let calls = 0;
+
+  await assert.rejects(
+    runWorkflow(`export const meta = { name: 'missing-cwd', description: 'missing cwd' }\nreturn await agent('no')`, {
+      cwd: missing,
+      persistLogs: false,
+      agent: {
+        async run() {
+          calls++;
+          return "unexpected";
+        },
+      },
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+      assert.match(error.message, /working directory.*does not exist|invalid working directory/i);
+      return true;
+    },
+  );
+  assert.equal(calls, 0);
+});
+
+test("workflow cwd must be a directory before logs, persistence, or agents start", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-dw-file-cwd-"));
+  const file = join(root, "not-a-directory");
+  writeFileSync(file, "regular file");
+  let calls = 0;
+  const run = () =>
+    runWorkflow(`export const meta = { name: 'file-cwd', description: 'file cwd' }\nreturn await agent('no')`, {
+      cwd: file,
+      agent: {
+        async run() {
+          calls++;
+          return "unexpected";
+        },
+      },
+    });
+
+  try {
+    for (const operation of [run, async () => new WorkflowManager({ cwd: file })]) {
+      await assert.rejects(operation, (error: unknown) => {
+        assert.ok(error instanceof WorkflowError);
+        assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+        assert.match(error.message, /workflow working directory.*not a directory/i);
+        return true;
+      });
+    }
+    assert.equal(calls, 0);
+    assert.equal(existsSync(join(file, ".pi")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("runWorkflow budget object exposes spent() and remaining()", async () => {

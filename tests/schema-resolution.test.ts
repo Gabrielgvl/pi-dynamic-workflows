@@ -38,6 +38,23 @@ describe("extractValidated", () => {
   it("returns undefined for malformed JSON", () => {
     assert.equal(extractValidated("{word: ", Schema), undefined);
   });
+
+  it("recovers schema-valid top-level primitive JSON values", () => {
+    assert.equal(extractValidated('"ready"', Type.String()), "ready");
+    assert.equal(extractValidated("42.5", Type.Number()), 42.5);
+    assert.equal(extractValidated("42", Type.Integer()), 42);
+    assert.equal(extractValidated("true", Type.Boolean()), true);
+    assert.equal(extractValidated("null", Type.Null()), null);
+    assert.equal(extractValidated('prose\n```json\n"ready"\n```\nmore prose', Type.String()), "ready");
+    assert.equal(extractValidated('"ready"', { enum: ["ready", "done"] } as const), "ready");
+  });
+
+  it("rejects ambiguous or trailing prose around bare primitive JSON", () => {
+    assert.equal(extractValidated("result: true", Type.Boolean()), undefined);
+    assert.equal(extractValidated("true trailing", Type.Boolean()), undefined);
+    assert.equal(extractValidated("42\n43", Type.Number()), undefined);
+    assert.equal(extractValidated('"ready" or "done"', { enum: ["ready", "done"] } as const), undefined);
+  });
 });
 
 describe("resolveStructuredOutput", () => {

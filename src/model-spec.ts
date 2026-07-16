@@ -56,6 +56,14 @@ const DEFAULT_MODEL_PER_PROVIDER: Record<string, string> = {
   "xiaomi-token-plan-sgp": "mimo-v2.5-pro",
 };
 
+export function selectSdkDefaultAvailableModel<T extends Model<any>>(models: readonly T[]): T | undefined {
+  for (const [provider, modelId] of Object.entries(DEFAULT_MODEL_PER_PROVIDER)) {
+    const match = models.find((model) => model.provider === provider && model.id === modelId);
+    if (match) return match;
+  }
+  return models[0];
+}
+
 export function isThinkingLevel(value: string): value is ModelThinkingLevel {
   return (THINKING_LEVELS as readonly string[]).includes(value);
 }

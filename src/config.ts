@@ -5,6 +5,12 @@
 /** Maximum number of agents allowed per workflow run. */
 export const MAX_AGENTS_PER_RUN = 1000;
 
+/** Clamp an explicit agent limit to the documented finite positive-integer range. */
+export function normalizeMaxAgents(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 1) return 1;
+  return Math.min(MAX_AGENTS_PER_RUN, Math.floor(value));
+}
+
 /** Default timeout for a single agent in milliseconds. null means no hard timeout. */
 export const DEFAULT_AGENT_TIMEOUT_MS = null;
 

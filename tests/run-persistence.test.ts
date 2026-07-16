@@ -359,6 +359,37 @@ test(
   }),
 );
 
+test(
+  "run persistence rejects unsafe run IDs before save, load, delete, or lease paths are constructed",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const invalidIds = ["", "../escape", "a/b", "a\\b", ".hidden", "line\nbreak", `a${"x".repeat(128)}`];
+    const base: PersistedRunState = {
+      runId: "valid",
+      workflowName: "wf",
+      script: "export const meta = { name: 'w', description: 'w' }",
+      status: "paused",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+    };
+
+    for (const runId of invalidIds) {
+      assert.throws(() => rp.save({ ...base, runId }), /Invalid workflow run ID/);
+      assert.throws(() => rp.load(runId), /Invalid workflow run ID/);
+      assert.throws(() => rp.delete(runId), /Invalid workflow run ID/);
+      assert.throws(() => rp.acquireRunLease(runId), /Invalid workflow run ID/);
+      assert.throws(() => rp.releaseRunLease({ runId, token: "token" }), /Invalid workflow run ID/);
+    }
+
+    const longestValid = `a${"x".repeat(127)}`;
+    rp.save({ ...base, runId: longestValid });
+    assert.equal(rp.load(longestValid)?.runId, longestValid);
+  }),
+);
+
 test("generateRunId returns a string with timestamp and random parts", () => {
   const id = generateRunId();
   assert.equal(typeof id, "string");
@@ -708,6 +739,49 @@ test(
     // A fresh manager (the previous process died) should recover the orphan.
     new WorkflowManager({ cwd });
     assert.equal(rp.load("stale")?.status, "paused", "stale running -> paused (journal preserved for resume)");
+  }),
+);
+
+test(
+  "WorkflowManager isolates invalid legacy run IDs while recovering later valid stale runs",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    rp.save({
+      runId: "valid-after-malformed",
+      workflowName: "w",
+      status: "running",
+      script: "export const meta = { name: 'w', description: 'd' }\nreturn 1",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+    } as PersistedRunState);
+
+    const legacyRunsDir = join(cwd, WORKFLOW_RUNS_DIR);
+    mkdirSync(legacyRunsDir, { recursive: true });
+    writeFileSync(
+      join(legacyRunsDir, "invalid-legacy.json"),
+      JSON.stringify({
+        runId: "../invalid-legacy",
+        workflowName: "malformed",
+        status: "running",
+        phases: [],
+        agents: [],
+        logs: [],
+        startedAt: "2024-01-02T00:00:00.000Z",
+        updatedAt: "2024-01-02T00:00:00.000Z",
+      }),
+      "utf-8",
+    );
+
+    assert.deepEqual(
+      rp.list().map((run) => run.runId),
+      ["valid-after-malformed"],
+      "unsafe persisted IDs are skipped before recovery can construct run paths",
+    );
+    new WorkflowManager({ cwd });
+    assert.equal(rp.load("valid-after-malformed")?.status, "paused");
   }),
 );
 

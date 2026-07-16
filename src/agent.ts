@@ -5,20 +5,28 @@ import type { AssistantMessage, Model, TextContent } from "@earendil-works/pi-ai
 import {
   AuthStorage,
   type CreateAgentSessionOptions,
+  type CreateAgentSessionResult,
   createAgentSession,
   createCodingTools,
+  DefaultResourceLoader,
   getAgentDir,
   ModelRegistry,
+  type ResourceLoader,
   SessionManager,
   SettingsManager,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import type { Static, TSchema } from "typebox";
+import type { TSchema } from "typebox";
 import { Check, Convert } from "typebox/value";
 import { type AgentHistoryEntry, compactAgentHistory } from "./agent-history.js";
 import { applyToolPolicy } from "./agent-registry.js";
 import { classifyProviderLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
-import { canonicalModelSpec, resolveModelSpecWithThinking } from "./model-spec.js";
+import {
+  canonicalModelSpec,
+  type ModelThinkingLevel,
+  resolveModelSpecWithThinking,
+  selectSdkDefaultAvailableModel,
+} from "./model-spec.js";
 import {
   formatTierFallbackNotice,
   loadModelTierConfig,
@@ -26,18 +34,25 @@ import {
   type RankableModel,
   resolveTierModel,
 } from "./model-tier-config.js";
-import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
+import {
+  createStructuredOutputTool,
+  type SchemaOutput,
+  type StructuredOutputCapture,
+  type WorkflowSchema,
+} from "./structured-output.js";
 
 /**
- * Find a JSON object/array in free-form text: a fenced ```json block if present,
- * else the first balanced {...} or [...]. Best-effort (the schema check is the
- * real gate). Returns the raw JSON string, or undefined when none is found.
+ * Find one JSON value in free-form text: a fenced ```json block if present,
+ * else the first balanced object/array. Bare primitive values are accepted only
+ * when they occupy the entire trimmed response, so adjacent prose or a second
+ * value cannot be mistaken for structured output. The schema check is the real
+ * gate after parsing.
  */
 function findJsonBlock(text: string): string | undefined {
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fence?.[1]) return fence[1].trim();
   const start = text.search(/[{[]/);
-  if (start === -1) return undefined;
+  if (start === -1) return text.trim() || undefined;
   const open = text[start];
   const close = open === "{" ? "}" : "]";
   let depth = 0;
@@ -53,7 +68,7 @@ function findJsonBlock(text: string): string | undefined {
  * it toward the schema, and accept it only if it then validates. Never fabricates
  * — returns undefined unless the parsed value genuinely satisfies the schema.
  */
-export function extractValidated<T>(text: string, schema: TSchema): T | undefined {
+export function extractValidated<T>(text: string, schema: WorkflowSchema): T | undefined {
   const json = findJsonBlock(text);
   if (json === undefined) return undefined;
   let parsed: unknown;
@@ -63,8 +78,8 @@ export function extractValidated<T>(text: string, schema: TSchema): T | undefine
     return undefined;
   }
   try {
-    const converted = Convert(schema, parsed);
-    if (Check(schema, converted)) return converted as T;
+    const converted = Convert(schema as TSchema, parsed);
+    if (Check(schema as TSchema, converted)) return converted as T;
   } catch {
     // typebox can throw on exotic schemas; treat as no match.
   }
@@ -122,7 +137,7 @@ export interface StructuredSession {
 export async function resolveStructuredOutput<T>(
   session: StructuredSession,
   capture: StructuredOutputCapture<T>,
-  schema: TSchema,
+  schema: WorkflowSchema,
   options: { maxSchemaRetries?: number; signal?: AbortSignal; label?: string },
   lastText: (messages: unknown[]) => string,
 ): Promise<T> {
@@ -201,6 +216,28 @@ export function resolveAgentModelSpec(
   return undefined;
 }
 
+export function resolveAgentThinkingLevel(
+  effort: ModelThinkingLevel | undefined,
+  modelThinking: ModelThinkingLevel | undefined,
+  inheritedThinking: CreateAgentSessionOptions["thinkingLevel"] | undefined,
+): CreateAgentSessionOptions["thinkingLevel"] | undefined {
+  return effort ?? modelThinking ?? inheritedThinking;
+}
+
+export type WorkflowSessionFactory = (options?: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
+export type WorkflowResourceLoaderOptions = ConstructorParameters<typeof DefaultResourceLoader>[0];
+
+export interface WorkflowSessionDefaults {
+  modelSpec?: string;
+  /** Exact SDK model selected with modelSpec, retained so availability drift cannot change it mid-workflow. */
+  model?: Model<any>;
+  thinkingLevel: NonNullable<CreateAgentSessionOptions["thinkingLevel"]>;
+}
+
+// Mirrors createAgentSession's fallback when settings.defaultThinkingLevel is absent.
+const SDK_DEFAULT_THINKING_LEVEL: WorkflowSessionDefaults["thinkingLevel"] = "medium";
+export type WorkflowResourceLoaderFactory = (options: WorkflowResourceLoaderOptions) => ResourceLoader;
+
 export interface WorkflowAgentOptions {
   cwd?: string;
   /** Extra tools available to the subagent in addition to the structured output tool. */
@@ -231,6 +268,14 @@ export interface WorkflowAgentOptions {
    * Default: false (current behavior).
    */
   persistAgentSessions?: boolean;
+  /** Exact, case-insensitive symbolic model aliases supplied by workflow settings. */
+  modelAliases?: Record<string, string>;
+  /** Reject unresolved requested model specs instead of using the session default. */
+  strictModelResolution?: boolean;
+  /** Test/embedder seam for session creation. */
+  sessionFactory?: WorkflowSessionFactory;
+  /** Test/embedder seam for resource-loader construction. */
+  resourceLoaderFactory?: WorkflowResourceLoaderFactory;
 }
 
 /**
@@ -268,12 +313,17 @@ export function listAvailableModelSpecs(registry?: ModelRegistry): string[] {
   return listAvailableModels(registry).map((model) => model.spec);
 }
 
-/**
- * Emitted at most once per process: when an agent asks for a tier but no
- * model-tiers.json exists, the tier silently falls back to the session model.
- * Surface that once (with the mapping the user would get by configuring) so the
- * no-op is discoverable. Diagnostics only — never lets a failure break a run.
- */
+/** Resolve only an exact symbolic alias (case-insensitive); all other specs are unchanged. */
+export function resolveModelAlias(spec: string, aliases: Record<string, string> | undefined): string {
+  const key = spec.trim().toLowerCase();
+  if (!key || !aliases) return spec.trim();
+  for (const [alias, target] of Object.entries(aliases)) {
+    if (alias.trim().toLowerCase() === key && target.trim()) return target.trim();
+  }
+  return spec.trim();
+}
+
+/** Emit the unconfigured tier fallback diagnostic at most once per process. */
 let warnedTierUnconfigured = false;
 function warnTierUnconfiguredOnce(mainModel: string | undefined, registry: ModelRegistry): void {
   if (warnedTierUnconfigured) return;
@@ -285,12 +335,7 @@ function warnTierUnconfiguredOnce(mainModel: string | undefined, registry: Model
   }
 }
 
-/**
- * Emitted at most once per process when persistAgentSessions is enabled and a
- * session is actually persisted: full subagent transcripts (which may include
- * secrets or other sensitive context) are being written to disk. Surface the
- * privacy trade-off at run time, not only in the docs.
- */
+/** Warn once when persisted subagent sessions may contain sensitive context. */
 let warnedPersistSecrets = false;
 function warnPersistSecretsOnce(sessionDir: string): void {
   if (warnedPersistSecrets) return;
@@ -310,12 +355,7 @@ export interface AgentUsage {
   cost: number;
 }
 
-/**
- * Map session stats to an AgentUsage, or undefined when the provider reported
- * no usage at all (all-zero stats). Returning undefined — instead of a zero
- * breakdown — lets displays fall back to their scalar token count, so setups
- * on non-reporting providers render the same as before the split existed.
- */
+/** Map non-zero session stats to the normalized usage shared by callbacks and telemetry. */
 export function usageFromStats(stats: {
   tokens: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
   cost: number;
@@ -332,7 +372,26 @@ export function usageFromStats(stats: {
   };
 }
 
-export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefined> {
+export interface AgentTelemetry {
+  execution: "live" | "replay";
+  requestedModelSpec?: string;
+  resolvedModel?: string;
+  effectiveThinkingLevel?: string;
+  skillsEnabled?: boolean;
+  loadedSkillCount?: number;
+  activeToolNames?: string[];
+  activeToolCount?: number;
+  systemPromptChars?: number;
+  projectContextFileCount?: number;
+  projectContextChars?: number;
+  usage?: AgentUsage;
+  /** Whether all retry attempts settled and their captured usage can be accounted without races. */
+  accountingStatus?: "exact" | "incomplete";
+  /** Attempts that exceeded the bounded post-abort cleanup grace. */
+  accountingIncompleteAttempts?: number;
+}
+
+export interface AgentRunOptions<TSchemaDef extends WorkflowSchema | undefined = undefined> {
   label?: string;
   /**
    * Display name recorded on the persisted session (session_info entry) when
@@ -352,6 +411,10 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * (all-zero stats), so consumers keep their scalar fallback.
    */
   onUsage?: (usage: AgentUsage) => void;
+  /** Called immediately before session creation, after all pre-session validation/setup succeeds. */
+  onSessionStart?: () => void;
+  /** Called once with exact live session/resource telemetry before disposal. */
+  onTelemetry?: (telemetry: AgentTelemetry) => void;
   /**
    * Model spec for this subagent: either `provider/modelId` (unambiguous) or a
    * bare `modelId`. When it can't be resolved, the session default is used and
@@ -367,6 +430,11 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * caring which concrete model backs that tier.
    */
   tier?: string;
+  /**
+   * Explicit Pi thinking level for this agent. Wins over a model `:thinking`
+   * suffix and over the inherited session thinking level.
+   */
+  effort?: ModelThinkingLevel;
   /** Called with the resolved model id once known (for display/telemetry). */
   onModelResolved?: (modelId: string) => void;
   /** Called when `model`/`tier`/phase resolved to a spec that wasn't found (fell back to session default). */
@@ -405,10 +473,26 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * omitted.
    */
   modelRegistry?: ModelRegistry;
+  /** Boolean skill policy bound from an agent definition. */
+  skills?: boolean;
+  /** Tier config snapshotted by the workflow runtime; null means no configured tiers. */
+  modelTierConfig?: ModelTierConfig | null;
+  /** Internal workflow-start snapshot used after implicit-medium resolution. */
+  sessionDefaultModelSpec?: string;
+  /** Exact model paired with sessionDefaultModelSpec at workflow start. */
+  sessionDefaultModel?: Model<any>;
+  /** Internal workflow-start thinking snapshot used when effort/model suffix are absent. */
+  sessionDefaultThinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
+  /** Models visible at workflow start, used for stable per-agent route resolution. */
+  modelSnapshot?: readonly Model<any>[];
+  /** Per-run aliases override constructor aliases. */
+  modelAliases?: Record<string, string>;
+  /** Per-run strictness overrides constructor strictness. */
+  strictModelResolution?: boolean;
 }
 
-export type AgentRunResult<TSchemaDef extends TSchema | undefined> = TSchemaDef extends TSchema
-  ? Static<TSchemaDef>
+export type AgentRunResult<TSchemaDef extends WorkflowSchema | undefined> = TSchemaDef extends WorkflowSchema
+  ? SchemaOutput<TSchemaDef>
   : string;
 
 export class WorkflowAgent {
@@ -420,6 +504,12 @@ export class WorkflowAgent {
   private readonly mainModel?: string;
   /** Shared registry from the host session, when provided. */
   private readonly sharedRegistry?: ModelRegistry;
+  private readonly modelAliases?: Record<string, string>;
+  private readonly strictModelResolution: boolean;
+  private readonly sessionFactory: WorkflowSessionFactory;
+  private readonly resourceLoaderFactory: WorkflowResourceLoaderFactory;
+  /** Lazily built once so replay snapshots and live sessions use the same settings source. */
+  private settingsManager?: SettingsManager;
   /** Lazily built once; shares the SDK's agentDir/auth so resolved models are authed. */
   private registry?: ModelRegistry;
 
@@ -431,6 +521,11 @@ export class WorkflowAgent {
     this.instructions = options.instructions;
     this.mainModel = options.mainModel;
     this.sharedRegistry = options.modelRegistry;
+    this.modelAliases = options.modelAliases;
+    this.strictModelResolution = options.strictModelResolution ?? false;
+    this.sessionFactory = options.sessionFactory ?? createAgentSession;
+    this.resourceLoaderFactory =
+      options.resourceLoaderFactory ?? ((loaderOptions) => new DefaultResourceLoader(loaderOptions));
   }
 
   /**
@@ -453,6 +548,67 @@ export class WorkflowAgent {
       this.registry = ModelRegistry.create(auth, join(dir, "models.json"));
     }
     return this.registry;
+  }
+
+  /** Resolve the exact registry this runner will use, for deterministic replay hashing. */
+  getModelRegistry(perRunRegistry?: ModelRegistry): ModelRegistry {
+    return this.getRegistry(perRunRegistry);
+  }
+
+  /** Use one settings manager for both replay snapshots and every live session. */
+  private getSettingsManager(): SettingsManager {
+    if (this.sessionOptions.settingsManager) return this.sessionOptions.settingsManager;
+    if (!this.settingsManager) this.settingsManager = SettingsManager.create(this.cwd, getAgentDir());
+    return this.settingsManager;
+  }
+
+  /** Whether createAgentSession already receives an exact Model object from session options. */
+  hasExplicitSessionModel(): boolean {
+    return this.sessionOptions.model !== undefined;
+  }
+
+  /**
+   * Snapshot the same settings defaults that createAgentSession will use when a
+   * call supplies no explicit model or thinking level. Replay identity consumes
+   * this snapshot, while live model routing remains inside run() so configured
+   * implicit tiers still participate.
+   */
+  async resolveSessionDefaults(perRunRegistry?: ModelRegistry): Promise<WorkflowSessionDefaults> {
+    const settingsManager = this.getSettingsManager();
+    let model = this.sessionOptions.model;
+    let modelSpec = model ? canonicalModelSpec(model) : undefined;
+
+    if (!modelSpec) {
+      const modelRegistry = this.getRegistry(perRunRegistry);
+      const provider = settingsManager.getDefaultProvider();
+      const modelId = settingsManager.getDefaultModel();
+      if (provider && modelId) {
+        const configured = modelRegistry.find(provider, modelId);
+        if (configured && modelRegistry.hasConfiguredAuth(configured)) {
+          model = configured;
+          modelSpec = canonicalModelSpec(configured);
+        }
+      }
+
+      if (!modelSpec) {
+        const available = await modelRegistry.getAvailable();
+        const fallback = selectSdkDefaultAvailableModel(available);
+        model = fallback;
+        modelSpec = fallback ? canonicalModelSpec(fallback) : undefined;
+      }
+    }
+
+    return {
+      modelSpec,
+      model,
+      thinkingLevel:
+        this.sessionOptions.thinkingLevel ?? settingsManager.getDefaultThinkingLevel() ?? SDK_DEFAULT_THINKING_LEVEL,
+    };
+  }
+
+  /** Backward-compatible model-only snapshot accessor. */
+  async resolveSessionDefaultModelSpec(perRunRegistry?: ModelRegistry): Promise<string | undefined> {
+    return (await this.resolveSessionDefaults(perRunRegistry)).modelSpec;
   }
 
   /**
@@ -492,7 +648,7 @@ export class WorkflowAgent {
     unlinkSync(probePath);
   }
 
-  async run<TSchemaDef extends TSchema | undefined = undefined>(
+  async run<TSchemaDef extends WorkflowSchema | undefined = undefined>(
     prompt: string,
     options: AgentRunOptions<TSchemaDef> = {},
   ): Promise<AgentRunResult<TSchemaDef>> {
@@ -521,45 +677,116 @@ export class WorkflowAgent {
     // Resolve the model spec (explicit model > tier > session default). This
     // composes with phase-based routing in workflow.ts, which only supplies
     // options.model when a phase pattern matches — so an explicit model wins.
-    const modelSpec = resolveAgentModelSpec(options, this.mainModel, loadModelTierConfig, () =>
-      warnTierUnconfiguredOnce(this.mainModel, this.getRegistry(options.modelRegistry)),
+    const modelSpec = resolveAgentModelSpec(
+      options,
+      this.mainModel,
+      () => (options.modelTierConfig === undefined ? loadModelTierConfig() : options.modelTierConfig),
+      () => warnTierUnconfiguredOnce(this.mainModel, this.getRegistry(options.modelRegistry)),
     );
 
-    // Resolve a requested model spec to a Model object. Specs use Pi CLI-style
-    // parsing, including an optional :thinking suffix such as gpt-5.5:xhigh.
-    // A given-but-unresolved spec falls back to the session default (with a
-    // warning) rather than failing.
+    const strictModelResolution = options.strictModelResolution ?? this.strictModelResolution;
+    if (strictModelResolution && options.tier && !modelSpec) {
+      throw new WorkflowError(
+        `Tier "${options.tier}" is unconfigured and no main-model fallback resolved`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false, agentLabel: options.label },
+      );
+    }
+
     const modelRegistry = this.getRegistry(options.modelRegistry);
+    const modelSnapshot = options.modelSnapshot;
+    const routingRegistry = modelSnapshot ? { getAll: () => [...modelSnapshot] } : modelRegistry;
+    // Only fall back to the SDK/settings default after resolveAgentModelSpec has
+    // had the opportunity to apply the implicit configured medium tier. A workflow
+    // supplies its start-of-run snapshot so later settings/availability drift is
+    // never consulted by a sequential untagged call.
+    if (options.signal?.aborted) throw new Error("Subagent was aborted");
+    const selectedModelSpec =
+      modelSpec ??
+      options.sessionDefaultModelSpec ??
+      (this.sessionOptions.model ? undefined : await this.resolveSessionDefaultModelSpec(modelRegistry));
+    if (options.signal?.aborted) throw new Error("Subagent was aborted");
+    // Resolve an exact symbolic alias before the existing CLI-style parsing and
+    // fuzzy matching. SDK defaults are already canonical and do not use aliases.
+    const aliases = options.modelAliases ?? this.modelAliases;
+    const effectiveModelSpec = modelSpec ? resolveModelAlias(modelSpec, aliases) : selectedModelSpec;
     let resolvedModel: Model<any> | undefined;
     let resolvedThinkingLevel: CreateAgentSessionOptions["thinkingLevel"] | undefined;
-    if (modelSpec) {
-      const resolved = resolveModelSpecWithThinking(modelSpec, modelRegistry);
+    if (!modelSpec && options.sessionDefaultModel && selectedModelSpec === options.sessionDefaultModelSpec) {
+      resolvedModel = options.sessionDefaultModel;
+      options.onModelResolved?.(canonicalModelSpec(resolvedModel));
+    } else if (effectiveModelSpec) {
+      const resolved = resolveModelSpecWithThinking(effectiveModelSpec, routingRegistry);
+      const syntheticCustomModel = resolved.warning?.includes("Using custom model id") ?? false;
+      if (strictModelResolution && (!resolved.model || syntheticCustomModel)) {
+        throw new WorkflowError(
+          `Model "${selectedModelSpec}" resolved to "${effectiveModelSpec}" but was not found`,
+          WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+          { recoverable: false, agentLabel: options.label },
+        );
+      }
       if (resolved.warning) console.warn(`[workflow] ${resolved.warning}`);
       if (resolved.model) {
         resolvedModel = resolved.model;
         resolvedThinkingLevel = resolved.thinkingLevel;
         options.onModelResolved?.(resolved.resolvedSpec ?? canonicalModelSpec(resolved.model));
       } else {
-        console.warn(`[workflow] model "${modelSpec}" not found; using session default`);
-        options.onModelFallback?.(modelSpec);
+        console.warn(`[workflow] model "${selectedModelSpec}" not found; using session default`);
+        options.onModelFallback?.(selectedModelSpec ?? effectiveModelSpec);
+        // When a workflow supplied an exact start snapshot, pin the fallback too;
+        // otherwise createAgentSession would consult mutable settings again.
+        if (options.sessionDefaultModel) resolvedModel = options.sessionDefaultModel;
       }
     }
+    const thinkingLevel = resolveAgentThinkingLevel(
+      options.effort,
+      resolvedThinkingLevel,
+      options.sessionDefaultThinkingLevel ?? this.sessionOptions.thinkingLevel,
+    );
 
     const agentDir = getAgentDir();
+    const injectedResourceLoader = this.sessionOptions.resourceLoader;
+    if (options.skills === false && injectedResourceLoader) {
+      throw new WorkflowError(
+        "skills:false cannot be enforced with an explicitly injected session.resourceLoader",
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false, agentLabel: options.label },
+      );
+    }
+    // Use one real SettingsManager for both loader and session so extensions,
+    // prompts, themes, project context, model settings, and custom tools retain
+    // the SDK's default discovery behavior. Only skills are suppressed.
+    const settingsManager = this.getSettingsManager();
+    if (options.signal?.aborted) throw new Error("Subagent was aborted");
+    const resourceLoader =
+      injectedResourceLoader ??
+      this.resourceLoaderFactory({
+        cwd: runCwd,
+        agentDir,
+        settingsManager,
+        ...(options.skills === false ? { noSkills: true } : {}),
+      });
+    if (!injectedResourceLoader) {
+      if (options.signal?.aborted) throw new Error("Subagent was aborted");
+      await resourceLoader.reload();
+      if (options.signal?.aborted) throw new Error("Subagent was aborted");
+    }
+
     // Key persisted sessions by the runner's project cwd (this.cwd), NOT the
     // per-call runCwd: agents working in short-lived git worktrees should still
     // group under the project's session dir instead of scattering across
     // temporary worktree paths.
+    if (options.signal?.aborted) throw new Error("Subagent was aborted");
     const sessionManager = this.createSessionManager();
-    const { session } = await createAgentSession({
+    if (options.signal?.aborted) throw new Error("Subagent was aborted");
+    options.onSessionStart?.();
+    if (options.signal?.aborted) throw new Error("Subagent was aborted");
+    const { session } = await this.sessionFactory({
       cwd: runCwd,
       agentDir,
       sessionManager,
-      // Use real SettingsManager to inherit user's default provider/model settings.
-      // SettingsManager.inMemory() doesn't load ~/.pi/settings.json, so subagents
-      // would fall back to the first available model (e.g. openai-codex) which may
-      // not have valid auth, causing silent empty responses.
-      settingsManager: SettingsManager.create(this.cwd, agentDir),
+      settingsManager,
+      resourceLoader,
       customTools,
       // Per-run modelRegistry wins over the constructor's shared registry
       // (see getRegistry() precedence above).
@@ -569,8 +796,22 @@ export class WorkflowAgent {
       ...this.sessionOptions,
       // Per-call model/thinking wins over any sessionOptions defaults.
       ...(resolvedModel ? { model: resolvedModel } : {}),
-      ...(resolvedThinkingLevel ? { thinkingLevel: resolvedThinkingLevel } : {}),
+      ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
     });
+    if (options.signal?.aborted) {
+      try {
+        await session.abort();
+      } catch {
+        // Cancellation is already authoritative; cleanup errors must not replace it.
+      } finally {
+        try {
+          session.dispose();
+        } catch {
+          // Cancellation is already authoritative; cleanup errors are diagnostic only.
+        }
+      }
+      throw new Error("Subagent was aborted");
+    }
 
     // Name the persisted session so it's identifiable in session pickers.
     // Skip when an injected session.sessionManager override won (tests/embedders).
@@ -584,6 +825,7 @@ export class WorkflowAgent {
 
     let removeAbortListener: (() => void) | undefined;
     let removeHistoryListener: (() => void) | undefined;
+    let workPhaseActiveToolNames: string[] | undefined;
     let lastHistoryEmit = 0;
     const emitHistory = () => options.onHistory?.(compactAgentHistory(session.messages));
     const maybeEmitHistory = () => {
@@ -605,6 +847,11 @@ export class WorkflowAgent {
       }
 
       await session.prompt(this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)));
+      try {
+        workPhaseActiveToolNames = session.getActiveToolNames();
+      } catch {
+        // Telemetry is best-effort; the finalizer can retry if this snapshot fails.
+      }
 
       if (options.signal?.aborted) throw new Error("Subagent was aborted");
 
@@ -636,13 +883,35 @@ export class WorkflowAgent {
       } catch {
         // History is diagnostic only; never let it mask the real result/error.
       }
-      // Read real usage before disposing — dispose tears down the session state.
-      if (options.onUsage) {
+      // Read stats exactly once, then feed the same normalized value to both
+      // callbacks so accounting and telemetry can never diverge.
+      let usage: AgentUsage | undefined;
+      try {
+        usage = usageFromStats(session.getSessionStats());
+        if (usage) options.onUsage?.(usage);
+      } catch {
+        // Diagnostics are best-effort; never mask the real result/error.
+      }
+      if (options.onTelemetry) {
         try {
-          const usage = usageFromStats(session.getSessionStats());
-          if (usage) options.onUsage(usage);
+          const contextFiles = resourceLoader.getAgentsFiles().agentsFiles;
+          const activeToolNames = workPhaseActiveToolNames ?? session.getActiveToolNames();
+          options.onTelemetry({
+            execution: "live",
+            requestedModelSpec: modelSpec,
+            resolvedModel: session.model ? canonicalModelSpec(session.model) : undefined,
+            effectiveThinkingLevel: session.thinkingLevel,
+            skillsEnabled: options.skills !== false,
+            loadedSkillCount: resourceLoader.getSkills().skills.length,
+            activeToolNames,
+            activeToolCount: activeToolNames.length,
+            systemPromptChars: session.systemPrompt.length,
+            projectContextFileCount: contextFiles.length,
+            projectContextChars: contextFiles.reduce((total, file) => total + file.content.length, 0),
+            usage,
+          });
         } catch {
-          // Usage is best-effort; never let stats failure mask the real result/error.
+          // Telemetry is diagnostic only; never mask the real result/error.
         }
       }
       session.dispose();
