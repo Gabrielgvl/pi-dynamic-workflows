@@ -5,17 +5,30 @@
 import { EventEmitter } from "node:events";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { WorkflowAgent } from "./agent.js";
+import { MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CONCURRENCY } from "./config.js";
+import { canonicalizeWorkflowCwd } from "./cwd.js";
 import { preview, type WorkflowSnapshot } from "./display.js";
 import { WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { normalizeJsonTree } from "./json-value.js";
 import {
   createRunPersistence,
   generateRunId,
+  type PersistedExecutionPolicy,
+  type PersistedPhaseBudget,
   type PersistedRunState,
   type RunLease,
   type RunPersistence,
   type RunStatus,
 } from "./run-persistence.js";
-import { type JournalEntry, parseWorkflowScript, runWorkflow, type WorkflowRunResult } from "./workflow.js";
+import {
+  type AgentTypePolicy,
+  type JournalEntry,
+  parseWorkflowScript,
+  runWorkflow,
+  type WorkflowPhaseBudget,
+  type WorkflowRunResult,
+  type WorkflowTokenUsage,
+} from "./workflow.js";
 
 export interface ManagedRun {
   runId: string;
@@ -28,10 +41,28 @@ export interface ManagedRun {
   /** The real script, kept so the run can be resumed. */
   script: string;
   args?: unknown;
+  /** Effective policy for this run; persisted so cold resume keeps strict overrides. */
+  agentTypePolicy: AgentTypePolicy;
+  /** Effective execution cwd and limits, persisted for cold resume. */
+  executionPolicy: PersistedExecutionPolicy;
+  /** Monotonic in-process generation used to reject stale persistence writes. */
+  generation: number;
+  /** Settlement of the currently active generation, including its final persistence write. */
+  settlement?: Promise<void>;
+  /** Bounded cancellation cleanup shared by pause/stop/resume. */
+  cancellationSettlement?: Promise<boolean>;
   /** Accumulated agent results for resume (deterministic call index -> result). */
   journal: JournalEntry[];
+  /** Cumulative per-phase budget accounting, durable across generations. */
+  phaseBudgets: Record<string, PersistedPhaseBudget>;
   /** Cross-process execution lease for this run, when it is actively executing. */
   lease?: RunLease;
+  /** Prevent stale execution settlement from releasing the lease before durable cleanup is safe. */
+  leaseReleaseBlocked?: boolean;
+  /** True when durable cleanup must remove the run rather than save an aborted marker. */
+  deletionRequested?: boolean;
+  /** Eventual retry loop that retains the lease until durable cleanup succeeds. */
+  durableCleanupSettlement?: Promise<void>;
   /**
    * True when the run was started in the background (or resumed) and the caller is
    * not awaiting its result inline. Only background runs deliver their result back
@@ -65,6 +96,10 @@ export interface ExecOptions {
   concurrency?: number;
   /** Retry attempts after recoverable agent failures for this execution. */
   agentRetries?: number;
+  /** Unknown explicit agentType behavior. Default: manager policy, then fallback. */
+  agentTypePolicy?: AgentTypePolicy;
+  /** Per-run execution cwd. Defaults to the manager construction cwd. */
+  cwd?: string;
   /** Resolve a checkpoint() question with a human reply (only for UI-bearing runs). */
   confirm?: (promptText: string, options: unknown) => Promise<unknown>;
   /**
@@ -97,15 +132,90 @@ export interface WorkflowManagerOptions {
   defaultAgentTimeoutMs?: number | null;
   /** Default retry attempts after recoverable agent failures. */
   defaultAgentRetries?: number;
+  /** Unknown explicit agentType behavior. Default: "fallback". */
+  agentTypePolicy?: AgentTypePolicy;
   /**
    * Persist each subagent transcript as a real pi session file under the
    * standard sessions directory. Default false (in-memory, discarded).
    */
   persistAgentSessions?: boolean;
+  /** Exact, case-insensitive symbolic model aliases from effective workflow settings. */
+  modelAliases?: Record<string, string>;
+  /** Reject unresolved requested model specs. */
+  strictModelResolution?: boolean;
+  /**
+   * Maximum time pause/stop/delete waits for an abort-ignoring generation before
+   * invalidating it and durably making it non-resumable. Default: 5 seconds.
+   */
+  cancellationGraceMs?: number;
+}
+
+export const DEFAULT_CANCELLATION_GRACE_MS = 5_000;
+
+const UNSAFE_MERGE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function isSafePlainObject(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== "string" || UNSAFE_MERGE_KEYS.has(key)) return false;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor?.enumerable || !("value" in descriptor)) return false;
+  }
+  return true;
+}
+
+function resumeValidationError(message: string): WorkflowError {
+  return new WorkflowError(message, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, { recoverable: false });
+}
+
+export interface ResumeOptions {
+  script?: string;
+  args?: unknown;
+  argsPatch?: Record<string, unknown>;
+}
+
+function normalizeConcurrency(value: number): number {
+  if (!Number.isFinite(value) || value < 1) return 1;
+  return Math.min(MAX_CONCURRENCY, Math.floor(value));
+}
+
+function normalizeRetries(value: number): number {
+  if (!Number.isFinite(value) || value < 0) return 0;
+  return Math.min(MAX_AGENT_RETRIES, Math.floor(value));
+}
+
+function restorePhaseBudgets(persisted: PersistedRunState): Record<string, PersistedPhaseBudget> {
+  if (persisted.phaseBudgets) {
+    return Object.fromEntries(
+      Object.entries(persisted.phaseBudgets).flatMap(([title, value]) => {
+        if (!Number.isFinite(value.budget) || value.budget <= 0) return [];
+        if (!Number.isFinite(value.spent) || value.spent < 0) return [];
+        return [[title, { budget: value.budget, spent: value.spent, warned: value.warned === true }]];
+      }),
+    );
+  }
+
+  const restored: Record<string, PersistedPhaseBudget> = {};
+  for (const agent of persisted.agents ?? []) {
+    if (!agent.phase) continue;
+    const tokens = agent.tokenUsage?.total ?? agent.tokens ?? 0;
+    if (!Number.isFinite(tokens) || tokens <= 0) continue;
+    let phaseBudget = restored[agent.phase];
+    if (!phaseBudget) {
+      phaseBudget = { budget: Number.MAX_SAFE_INTEGER, spent: 0, warned: false };
+      restored[agent.phase] = phaseBudget;
+    }
+    phaseBudget.spent += tokens;
+  }
+  return restored;
 }
 
 export class WorkflowManager extends EventEmitter {
   private runs = new Map<string, ManagedRun>();
+  /** Run ids deleted while an execution may still be unwinding. */
+  private deletedRunIds = new Set<string>();
   private persistence: RunPersistence;
   private cwd: string;
   private concurrency: number;
@@ -119,11 +229,15 @@ export class WorkflowManager extends EventEmitter {
   private sessionId?: string;
   private defaultAgentTimeoutMs: number | null;
   private defaultAgentRetries: number;
+  private agentTypePolicy: AgentTypePolicy;
   private persistAgentSessions: boolean;
+  private modelAliases?: Record<string, string>;
+  private strictModelResolution: boolean;
+  private cancellationGraceMs: number;
 
   constructor(options: WorkflowManagerOptions = {}) {
     super();
-    this.cwd = options.cwd ?? process.cwd();
+    this.cwd = canonicalizeWorkflowCwd(options.cwd ?? process.cwd());
     this.concurrency = options.concurrency ?? 8;
     this.loadSavedWorkflow = options.loadSavedWorkflow;
     this.agent = options.agent;
@@ -132,7 +246,11 @@ export class WorkflowManager extends EventEmitter {
     this.sessionId = options.sessionId;
     this.defaultAgentTimeoutMs = options.defaultAgentTimeoutMs ?? null;
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
+    this.agentTypePolicy = options.agentTypePolicy ?? "fallback";
     this.persistAgentSessions = options.persistAgentSessions ?? false;
+    this.modelAliases = options.modelAliases ? { ...options.modelAliases } : undefined;
+    this.strictModelResolution = options.strictModelResolution ?? false;
+    this.cancellationGraceMs = Math.max(1, Math.floor(options.cancellationGraceMs ?? DEFAULT_CANCELLATION_GRACE_MS));
     this.persistence = createRunPersistence(this.cwd);
     this.recoverStaleRuns();
   }
@@ -185,6 +303,159 @@ export class WorkflowManager extends EventEmitter {
     return this.modelRegistry;
   }
 
+  private resolveExecutionPolicy(exec: ExecOptions = {}, legacy?: PersistedRunState): PersistedExecutionPolicy {
+    const persisted = legacy?.executionPolicy;
+    if (persisted) {
+      return { ...persisted, cwd: canonicalizeWorkflowCwd(persisted.cwd, { persisted: true }) };
+    }
+    const requestedCwd = exec.cwd ?? legacy?.cwd ?? this.cwd;
+    const cwd = canonicalizeWorkflowCwd(requestedCwd, { persisted: legacy?.cwd === requestedCwd });
+    return {
+      cwd,
+      maxAgents: exec.maxAgents ?? MAX_AGENTS_PER_RUN,
+      agentTimeoutMs: exec.agentTimeoutMs !== undefined ? exec.agentTimeoutMs : this.defaultAgentTimeoutMs,
+      tokenBudget: exec.tokenBudget ?? null,
+      concurrency: normalizeConcurrency(exec.concurrency ?? this.concurrency),
+      agentRetries: normalizeRetries(exec.agentRetries ?? this.defaultAgentRetries),
+      agentTypePolicy: exec.agentTypePolicy ?? legacy?.agentTypePolicy ?? this.agentTypePolicy,
+    };
+  }
+
+  private trackExecution<T>(managed: ManagedRun, execution: Promise<T>): Promise<T> {
+    managed.settlement = execution.then(
+      () => undefined,
+      () => undefined,
+    );
+    return execution;
+  }
+
+  private ownsGeneration(managed: ManagedRun, generation: number): boolean {
+    return (
+      !this.deletedRunIds.has(managed.runId) &&
+      this.runs.get(managed.runId) === managed &&
+      managed.generation === generation
+    );
+  }
+
+  private settlementWithinGrace(settlement: Promise<void>): Promise<boolean> {
+    return new Promise((resolve) => {
+      let finished = false;
+      const timer = setTimeout(() => {
+        if (finished) return;
+        finished = true;
+        resolve(false);
+      }, this.cancellationGraceMs);
+      timer.unref?.();
+      settlement.then(() => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        resolve(true);
+      });
+    });
+  }
+
+  /** Verify that persistence reflects the requested lifecycle state before releasing its lease. */
+  private durableCancellationCleanupIsSafe(managed: ManagedRun): boolean {
+    try {
+      const persisted = this.persistence.load(managed.runId);
+      if (managed.deletionRequested) return persisted === null;
+      if (managed.status === "paused") return persisted?.status === "paused";
+      return persisted === null || persisted.status === "aborted";
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Keep retrying the requested lifecycle marker/deletion while retaining the
+   * lease. A legitimate pause is never deleted as a persistence fallback because
+   * that would silently destroy resumability. An aborted run (stop or cancellation
+   * timeout) may fall back to deletion because both outcomes are non-resumable.
+   */
+  private retainLeaseUntilDurableCleanup(managed: ManagedRun): void {
+    managed.leaseReleaseBlocked = true;
+    if (managed.durableCleanupSettlement) return;
+
+    let attempt = () => {};
+    const settlement = new Promise<void>((resolve) => {
+      attempt = () => {
+        try {
+          if (managed.deletionRequested) {
+            this.persistence.delete(managed.runId, { preserveLock: true });
+          } else if (managed.status === "paused") {
+            this.persistRun(managed, true);
+          } else {
+            try {
+              this.persistRun(managed, true);
+            } catch {
+              this.persistence.delete(managed.runId, { preserveLock: true });
+            }
+          }
+        } catch {
+          // Verification below keeps the lease when cleanup remains unsafe.
+        }
+
+        if (this.durableCancellationCleanupIsSafe(managed)) {
+          managed.durableCleanupSettlement = undefined;
+          managed.leaseReleaseBlocked = false;
+          this.releaseRunLease(managed);
+          resolve();
+          return;
+        }
+
+        const timer = setTimeout(attempt, Math.min(this.cancellationGraceMs, 100));
+        timer.unref?.();
+      };
+    });
+    managed.durableCleanupSettlement = settlement;
+    attempt();
+  }
+
+  /**
+   * Bound cancellation settlement, but release paused/stopped/deleted runs only
+   * after persistence reflects a safe lifecycle marker. Failed pause writes keep
+   * retrying the paused marker; failed stop/delete cleanup retains the lease so a
+   * second process cannot recover or resume stale state.
+   */
+  private scheduleCancellationCleanup(managed: ManagedRun): Promise<boolean> {
+    const requiresDurableCleanup =
+      managed.deletionRequested || managed.status === "paused" || managed.status === "aborted";
+    if (requiresDurableCleanup && managed.lease) managed.leaseReleaseBlocked = true;
+    if (managed.cancellationSettlement) {
+      if (requiresDurableCleanup) {
+        void managed.cancellationSettlement.then(() => this.retainLeaseUntilDurableCleanup(managed));
+      }
+      return managed.cancellationSettlement;
+    }
+    const generation = managed.generation;
+    const settlement = managed.settlement;
+    if (!settlement) {
+      if (requiresDurableCleanup) this.retainLeaseUntilDurableCleanup(managed);
+      else this.releaseRunLease(managed);
+      return Promise.resolve(true);
+    }
+    managed.cancellationSettlement = this.settlementWithinGrace(settlement).then((settled) => {
+      if (settled) {
+        if (requiresDurableCleanup) this.retainLeaseUntilDurableCleanup(managed);
+        return true;
+      }
+      if (this.ownsGeneration(managed, generation)) {
+        managed.leaseReleaseBlocked = true;
+        managed.generation++;
+        managed.status = "aborted";
+        managed.error = new WorkflowError(
+          `Workflow cancellation did not settle within ${this.cancellationGraceMs}ms; the run was aborted and cannot be resumed safely.`,
+          WorkflowErrorCode.WORKFLOW_ABORTED,
+          { recoverable: false },
+        );
+      }
+      this.retainLeaseUntilDurableCleanup(managed);
+      return false;
+    });
+    return managed.cancellationSettlement;
+  }
+
   /**
    * Start a workflow in the background.
    * Returns immediately with a run ID; the workflow executes asynchronously.
@@ -195,6 +466,7 @@ export class WorkflowManager extends EventEmitter {
     exec: ExecOptions = {},
   ): { runId: string; promise: Promise<WorkflowRunResult> } {
     const parsed = parseWorkflowScript(script);
+    const executionPolicy = this.resolveExecutionPolicy(exec);
     const slug = parsed.meta.name
       ? parsed.meta.name
           .toLowerCase()
@@ -225,7 +497,11 @@ export class WorkflowManager extends EventEmitter {
       startedAt: new Date(),
       script,
       args,
+      agentTypePolicy: executionPolicy.agentTypePolicy,
+      executionPolicy,
+      generation: 1,
       journal: [],
+      phaseBudgets: {},
       background: true,
       lease,
       autoResume: exec.autoResume,
@@ -234,21 +510,7 @@ export class WorkflowManager extends EventEmitter {
     this.runs.set(runId, managed);
 
     try {
-      // Persist initial state
-      this.persistence.save({
-        runId,
-        workflowName: parsed.meta.name,
-        script,
-        args,
-        sessionId: this.sessionId,
-        status: "running",
-        phases: managed.snapshot.phases,
-        agents: [],
-        logs: [],
-        startedAt: managed.startedAt.toISOString(),
-        updatedAt: managed.startedAt.toISOString(),
-        autoResume: managed.autoResume,
-      });
+      this.persistRun(managed, true);
     } catch (err) {
       this.releaseRunLease(managed);
       this.runs.delete(runId);
@@ -260,7 +522,7 @@ export class WorkflowManager extends EventEmitter {
     // when a workflow is aborted/paused/stopped — executeRun()'s catch block
     // already records status/event/persist, but the promise still rejects.
     // The original promise is returned so callers can await it in try/catch.
-    const promise = this.executeRun(managed, script, args, exec);
+    const promise = this.trackExecution(managed, this.executeRun(managed, script, args, exec));
     promise.catch(() => {});
 
     return { runId, promise };
@@ -273,7 +535,8 @@ export class WorkflowManager extends EventEmitter {
    * a caller (e.g. the workflow tool) drive its own inline display.
    */
   async runSync(script: string, args?: unknown, exec: ExecOptions = {}): Promise<WorkflowRunResult> {
-    const managed = this.createManaged(script, args);
+    const executionPolicy = this.resolveExecutionPolicy(exec);
+    const managed = this.createManaged(script, args, executionPolicy);
     const lease = this.persistence.acquireRunLease(managed.runId);
     if (!lease) throw new Error(`Could not acquire workflow run lease for ${managed.runId}`);
     managed.lease = lease;
@@ -282,11 +545,11 @@ export class WorkflowManager extends EventEmitter {
     // Persist the initial state immediately so listRuns()/the task panel can see
     // the run the moment it starts, not only after the first agent journals.
     this.persistRun(managed);
-    return this.executeRun(managed, script, args, exec);
+    return this.trackExecution(managed, this.executeRun(managed, script, args, exec));
   }
 
   /** Build a fresh managed run with an empty snapshot. */
-  private createManaged(script: string, args?: unknown): ManagedRun {
+  private createManaged(script: string, args: unknown, executionPolicy: PersistedExecutionPolicy): ManagedRun {
     const parsed = parseWorkflowScript(script);
     const slug = parsed.meta.name
       ? parsed.meta.name
@@ -314,7 +577,11 @@ export class WorkflowManager extends EventEmitter {
       startedAt: new Date(),
       script,
       args,
+      agentTypePolicy: executionPolicy.agentTypePolicy,
+      executionPolicy,
+      generation: 1,
       journal: [],
+      phaseBudgets: {},
       background: false,
     };
   }
@@ -325,21 +592,17 @@ export class WorkflowManager extends EventEmitter {
     args?: unknown,
     exec: ExecOptions = {},
   ): Promise<WorkflowRunResult> {
-    const {
-      resumeJournal,
-      maxAgents,
-      agentTimeoutMs,
-      externalSignal,
-      onProgress,
-      tokenBudget,
-      concurrency,
-      agentRetries,
-      confirm,
-    } = exec;
-    const resolvedAgentTimeoutMs = agentTimeoutMs !== undefined ? agentTimeoutMs : this.defaultAgentTimeoutMs;
-    const resolvedConcurrency = concurrency ?? this.concurrency;
-    const resolvedAgentRetries = agentRetries ?? this.defaultAgentRetries;
+    const { resumeJournal, externalSignal, onProgress, confirm } = exec;
+    const generation = managed.generation;
+    const owns = () => this.ownsGeneration(managed, generation);
+    const policy = managed.executionPolicy;
     const progress = () => onProgress?.(managed.snapshot);
+    const updateTokenUsage = (usage: WorkflowTokenUsage) => {
+      if (!owns()) return;
+      managed.snapshot.tokenUsage = usage;
+      this.emit("tokenUsage", { runId: managed.runId, usage });
+      progress();
+    };
     // Let a host abort (e.g. Esc during a blocking tool call) cancel this run.
     if (externalSignal) {
       if (externalSignal.aborted) managed.controller.abort();
@@ -347,7 +610,7 @@ export class WorkflowManager extends EventEmitter {
     }
     try {
       const result = await runWorkflow(script, {
-        cwd: this.cwd,
+        cwd: policy.cwd,
         args,
         // Use the managed run's persisted id as the workflow runId so the value
         // returned in result.runId matches the id that listRuns()/resume() use.
@@ -358,28 +621,46 @@ export class WorkflowManager extends EventEmitter {
         mainModel: this.mainModel,
         modelRegistry: this.modelRegistry,
         persistAgentSessions: this.persistAgentSessions,
+        modelAliases: this.modelAliases,
+        strictModelResolution: this.strictModelResolution,
         signal: managed.controller.signal,
-        concurrency: resolvedConcurrency,
-        agentRetries: resolvedAgentRetries,
-        maxAgents,
-        agentTimeoutMs: resolvedAgentTimeoutMs,
-        tokenBudget,
+        concurrency: policy.concurrency,
+        agentRetries: policy.agentRetries,
+        agentTypePolicy: policy.agentTypePolicy,
+        maxAgents: policy.maxAgents,
+        agentTimeoutMs: policy.agentTimeoutMs,
+        tokenBudget: policy.tokenBudget,
+        initialTokenUsage: resumeJournal ? managed.snapshot.tokenUsage : undefined,
+        initialPhaseBudgets: resumeJournal ? managed.phaseBudgets : undefined,
         confirm,
         loadSavedWorkflow: this.loadSavedWorkflow,
         resumeJournal,
         resumeFromRunId: resumeJournal ? managed.runId : undefined,
         onAgentJournal: (entry) => {
-          // Append (crash-safe-ish): keep the latest entry per index, then persist.
-          managed.journal = managed.journal.filter((e) => e.index !== entry.index);
-          managed.journal.push(entry);
-          this.persistRun(managed);
+          if (!owns()) return;
+          // The store commits only after this callback returns. Require the journal
+          // write and restore the in-memory journal if persistence fails.
+          const previous = managed.journal;
+          managed.journal = [...managed.journal.filter((e) => e.index !== entry.index), entry];
+          try {
+            this.persistRun(managed, true);
+          } catch (error) {
+            managed.journal = previous;
+            throw error;
+          }
         },
         onLog: (message) => {
+          if (!owns()) return;
           managed.snapshot.logs.push(message);
           this.emit("log", { runId: managed.runId, message });
           progress();
         },
+        onPhaseBudgetProgress: (title: string, phaseBudget: WorkflowPhaseBudget) => {
+          if (!owns()) return;
+          managed.phaseBudgets[title] = { ...phaseBudget };
+        },
         onPhase: (title) => {
+          if (!owns()) return;
           managed.snapshot.currentPhase = title;
           if (!managed.snapshot.phases.includes(title)) {
             managed.snapshot.phases.push(title);
@@ -388,8 +669,10 @@ export class WorkflowManager extends EventEmitter {
           progress();
         },
         onAgentStart: (event) => {
+          if (!owns()) return;
           managed.snapshot.agents.push({
             id: managed.snapshot.agents.length + 1,
+            callId: event.callId,
             label: event.label,
             phase: event.phase,
             prompt: event.prompt,
@@ -400,39 +683,53 @@ export class WorkflowManager extends EventEmitter {
           progress();
         },
         onAgentEnd: (event) => {
+          if (!owns()) return;
           const agent = [...managed.snapshot.agents]
             .reverse()
-            .find((a) => a.label === event.label && a.status === "running");
+            .find(
+              (candidate) =>
+                candidate.status === "running" &&
+                (event.callId ? candidate.callId === event.callId : candidate.label === event.label),
+            );
           if (agent) {
-            agent.status = event.result === null ? "error" : "done";
+            const hasErrorMetadata = event.error !== undefined || event.errorCode !== undefined;
+            agent.status = hasErrorMetadata ? "error" : "done";
             agent.resultPreview = preview(event.result);
             agent.error = event.error;
             agent.errorCode = event.errorCode;
             agent.recoverable = event.recoverable;
             agent.tokens = event.tokens;
             if (event.tokenUsage) agent.tokenUsage = event.tokenUsage;
+            agent.telemetry = event.telemetry;
             if (event.model) agent.model = event.model;
           }
           this.emit("agentEnd", { runId: managed.runId, ...event });
           progress();
         },
         onAgentHistory: (event) => {
+          if (!owns()) return;
           const agent = [...managed.snapshot.agents]
             .reverse()
-            .find((a) => a.label === event.label && a.status === "running");
+            .find(
+              (candidate) =>
+                candidate.status === "running" &&
+                (event.callId ? candidate.callId === event.callId : candidate.label === event.label),
+            );
           if (agent) {
             agent.history = event.history;
           }
           this.emit("agentHistory", { runId: managed.runId, ...event });
           progress();
         },
-        onTokenUsage: (usage) => {
-          managed.snapshot.tokenUsage = usage;
-          this.emit("tokenUsage", { runId: managed.runId, usage });
-          progress();
-        },
+        onTokenUsageProgress: updateTokenUsage,
+        onTokenUsage: updateTokenUsage,
       });
 
+      if (!owns()) {
+        throw new WorkflowError("Workflow generation no longer owns this run", WorkflowErrorCode.WORKFLOW_ABORTED, {
+          recoverable: false,
+        });
+      }
       managed.status = "completed";
       managed.result = result;
       this.emit("complete", { runId: managed.runId, result });
@@ -452,6 +749,11 @@ export class WorkflowManager extends EventEmitter {
               { recoverable: true },
             );
 
+      if (!owns()) {
+        this.releaseRunLease(managed);
+        throw workflowError;
+      }
+
       const usageLimitPaused =
         !managed.controller.signal.aborted && workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
       if (managed.controller.signal.aborted) {
@@ -464,6 +766,7 @@ export class WorkflowManager extends EventEmitter {
         // the persisted journal (completed agent results) is replayed by resume()
         // once the budget refills — instead of the user starting from scratch.
         managed.status = "paused";
+        managed.leaseReleaseBlocked = Boolean(managed.lease);
       } else {
         managed.status = "failed";
       }
@@ -475,13 +778,16 @@ export class WorkflowManager extends EventEmitter {
           error: workflowError,
           resetHint: workflowError.resetHint,
         });
-      } else {
+      } else if (this.listenerCount("error") > 0) {
         this.emit("error", { runId: managed.runId, error: workflowError });
       }
 
-      // Persist final state
+      // Persist final state. A usage-limit pause has no external cancellation
+      // cleanup callback, so it starts its own durable-marker retry before the
+      // execution lease can be released.
       this.persistRun(managed);
-      this.releaseRunLease(managed);
+      if (usageLimitPaused) this.retainLeaseUntilDurableCleanup(managed);
+      else this.releaseRunLease(managed);
 
       throw workflowError;
     }
@@ -489,11 +795,18 @@ export class WorkflowManager extends EventEmitter {
 
   private releaseRunLease(managed: ManagedRun): void {
     if (!managed.lease) return;
+    if (managed.leaseReleaseBlocked) {
+      if (!this.durableCancellationCleanupIsSafe(managed)) return;
+      managed.leaseReleaseBlocked = false;
+    }
     this.persistence.releaseRunLease(managed.lease);
     managed.lease = undefined;
   }
 
-  private persistRun(managed: ManagedRun) {
+  private persistRun(managed: ManagedRun, required = false) {
+    if (this.deletedRunIds.has(managed.runId)) return;
+    const current = this.runs.get(managed.runId);
+    if (current && current.generation !== managed.generation) return;
     try {
       this.persistence.save({
         runId: managed.runId,
@@ -502,6 +815,9 @@ export class WorkflowManager extends EventEmitter {
         // in workflow run storage — protect via directory permissions, not blanking.
         script: managed.script,
         args: managed.args,
+        cwd: managed.executionPolicy.cwd,
+        executionPolicy: managed.executionPolicy,
+        agentTypePolicy: managed.agentTypePolicy,
         sessionId: this.sessionId,
         journal: managed.journal,
         status: managed.status,
@@ -521,6 +837,7 @@ export class WorkflowManager extends EventEmitter {
             : undefined,
         phases: managed.snapshot.phases,
         currentPhase: managed.snapshot.currentPhase,
+        phaseBudgets: managed.phaseBudgets,
         agents: managed.snapshot.agents.map((a) => ({
           ...a,
           startedAt: managed.startedAt.toISOString(),
@@ -544,6 +861,7 @@ export class WorkflowManager extends EventEmitter {
         durationMs: managed.result?.durationMs,
       });
     } catch (err) {
+      if (required) throw err;
       // Persistence is best-effort: the run is still healthy in memory.
       // Log so an operator debugging state-loss has a lead, but never crash
       // the workflow over a disk-full situation.
@@ -560,79 +878,192 @@ export class WorkflowManager extends EventEmitter {
 
     managed.controller.abort();
     managed.status = "paused";
+    managed.leaseReleaseBlocked = Boolean(managed.lease);
     this.emit("paused", { runId });
     this.persistRun(managed);
-    this.releaseRunLease(managed);
+    // A normal pause remains resumable after settlement. The bounded cleanup
+    // invalidates an abort-ignoring generation and makes it durably non-resumable.
+    void this.scheduleCancellationCleanup(managed);
     return true;
   }
 
-  /**
-   * Resume an interrupted run: replay journaled results for the unchanged prefix
-   * and run the rest live. Returns false if there is nothing resumable.
-   *
-   * `opts.script` lets the orchestrating model resume with an EDITED script
-   * (cached-prefix reuse / iteration): unchanged agent() calls whose content
-   * hash still matches the journal entry at their positional callIndex replay
-   * from cache, while the first changed or newly inserted call — and everything
-   * after it — re-runs live. When `opts.script` is omitted, resume behaves
-   * exactly as before and uses the persisted script (auto-resume, TUI resume);
-   * this keeps the existing single-arg `resume(runId)` callers (e.g. the
-   * UsageLimitScheduler) unchanged. `opts.args` overrides the persisted args
-   * only when provided; otherwise the persisted args are kept.
-   */
-  async resume(runId: string, opts?: { script?: string; args?: unknown }): Promise<boolean> {
-    // Guard: refuse to resume a run that is already running, or one that was
-    // intentionally aborted (pause/stop/Esc). Paused and failed runs can restart.
-    const active = this.runs.get(runId);
-    if (active?.status === "running") return false;
-    if (active?.status === "aborted") return false;
+  /** Resume with the persisted input, an edited script/input replacement, or a safe shallow args patch. */
+  async resume(runId: string, options: ResumeOptions = {}): Promise<boolean> {
+    const hasArgs = Object.hasOwn(options, "args") && options.args !== undefined;
+    const hasArgsPatch = Object.hasOwn(options, "argsPatch");
+    if (hasArgs && hasArgsPatch) {
+      throw resumeValidationError("resume args and argsPatch are mutually exclusive");
+    }
+    if (hasArgsPatch && !isSafePlainObject(options.argsPatch)) {
+      throw resumeValidationError("resume argsPatch must be a safe plain object");
+    }
 
-    const persisted = this.persistence.load(runId);
-    if (!persisted?.script || persisted.status === "completed" || persisted.status === "aborted") return false;
+    const active = this.runs.get(runId);
+    if (active?.status === "running" || active?.status === "aborted") return false;
+    // A paused generation keeps exclusive ownership while it unwinds. This wait
+    // is bounded; timeout invalidates that generation and makes the run safely
+    // non-resumable instead of allowing overlap or hanging forever.
+    const settled = active?.cancellationSettlement
+      ? await active.cancellationSettlement
+      : active?.settlement
+        ? await this.settlementWithinGrace(active.settlement)
+        : true;
+    if (!settled) {
+      throw (
+        active?.error ??
+        new WorkflowError(
+          `Workflow cancellation did not settle within ${this.cancellationGraceMs}ms; the run cannot be resumed safely.`,
+          WorkflowErrorCode.WORKFLOW_ABORTED,
+          { recoverable: false },
+        )
+      );
+    }
+
+    // Acquire first, then reload every persisted field under the lease. This
+    // closes the status/script/args/journal/policy TOCTOU window between callers.
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) return false;
+    let leaseTransferred = false;
+    try {
+      const persisted = this.persistence.load(runId);
+      if (
+        !persisted?.script ||
+        persisted.status === "running" ||
+        persisted.status === "completed" ||
+        persisted.status === "aborted"
+      ) {
+        return false;
+      }
 
-    // Use the edited script when supplied, else the persisted one (backward-compat).
-    const script = opts?.script ?? persisted.script;
-    const args = opts?.args !== undefined ? opts.args : persisted.args;
+      let resumedArgs = hasArgs ? options.args : persisted.args;
+      if (hasArgsPatch) {
+        const argsPatch = options.argsPatch as Record<string, unknown>;
+        if (persisted.args !== undefined && !isSafePlainObject(persisted.args)) {
+          throw resumeValidationError("persisted workflow args are incompatible with argsPatch");
+        }
+        try {
+          const normalizedPatch = normalizeJsonTree(argsPatch) as Record<string, unknown>;
+          resumedArgs = normalizeJsonTree({
+            ...((persisted.args as Record<string, unknown> | undefined) ?? {}),
+            ...normalizedPatch,
+          });
+        } catch {
+          throw resumeValidationError("resume argsPatch must contain only plain JSON values");
+        }
+      }
 
-    const controller = new AbortController();
-    const managed: ManagedRun = {
-      runId,
-      status: "running",
-      snapshot: {
-        name: persisted.workflowName,
-        phases: persisted.phases ?? [],
-        logs: persisted.logs ?? [],
-        agents: [],
-        agentCount: 0,
-        runningCount: 0,
-        doneCount: 0,
-        errorCount: 0,
-      },
-      controller,
-      startedAt: new Date(),
-      // The (possibly edited) script + args become the run's own — persistRun()
-      // writes them below, so a later resume of this run sees the edited script.
-      script,
-      args,
-      journal: persisted.journal ?? [],
-      background: true,
-      lease,
-      // Carry the original opt-out forward across resumes; it's fixed at
-      // run-start and persistRun() re-persists it on every subsequent write.
-      autoResume: persisted.autoResume,
-    };
-    this.runs.set(runId, managed);
-    // Persist before notifying renderers: listRuns() is their source of truth for
-    // lifecycle status, while getRun() supplies the live in-memory snapshot.
-    this.persistRun(managed);
+      const script = options.script ?? persisted.script;
+      const parsed = parseWorkflowScript(script);
+      const executionPolicy = this.resolveExecutionPolicy({}, persisted);
+      const managed: ManagedRun = {
+        runId,
+        status: "running",
+        snapshot: {
+          name: parsed.meta.name,
+          phases: persisted.phases ?? [],
+          logs: persisted.logs ?? [],
+          agents: [],
+          agentCount: 0,
+          runningCount: 0,
+          doneCount: 0,
+          errorCount: 0,
+          tokenUsage: persisted.tokenUsage
+            ? {
+                input: persisted.tokenUsage.input,
+                output: persisted.tokenUsage.output,
+                total: persisted.tokenUsage.total,
+                cost: persisted.tokenUsage.cost,
+                cacheRead: persisted.tokenUsage.cacheRead,
+                cacheWrite: persisted.tokenUsage.cacheWrite,
+              }
+            : undefined,
+        },
+        controller: new AbortController(),
+        startedAt: new Date(),
+        script,
+        args: resumedArgs,
+        agentTypePolicy: executionPolicy.agentTypePolicy,
+        executionPolicy,
+        generation: (active?.generation ?? 0) + 1,
+        journal: persisted.journal ?? [],
+        phaseBudgets: restorePhaseBudgets(persisted),
+        background: true,
+        lease,
+        autoResume: persisted.autoResume,
+      };
+      this.runs.set(runId, managed);
+      try {
+        this.persistRun(managed, true);
+      } catch (error) {
+        if (active) this.runs.set(runId, active);
+        else this.runs.delete(runId);
+        throw error;
+      }
+      leaseTransferred = true;
 
-    const resumeJournal = new Map((persisted.journal ?? []).map((e) => [e.index, e] as const));
-    this.emit("resumed", { runId });
-    // Run in the background; executeRun records status/errors on the managed run.
-    void this.executeRun(managed, script, args, { resumeJournal }).catch(() => {});
-    return true;
+      const resumeJournal = new Map((persisted.journal ?? []).map((entry) => [entry.index, entry] as const));
+      this.emit("resumed", { runId });
+      const execution = this.trackExecution(managed, this.executeRun(managed, script, resumedArgs, { resumeJournal }));
+      execution.catch(() => {});
+      return true;
+    } finally {
+      if (!leaseTransferred) this.persistence.releaseRunLease(lease);
+    }
+  }
+
+  /** Acquire and revalidate a settled paused run before cross-process mutation. */
+  private acquireSettledPausedRunLease(managed: ManagedRun): boolean {
+    if (managed.status !== "paused" || managed.lease) return true;
+
+    let lease: RunLease | null = null;
+    try {
+      lease = this.persistence.acquireRunLease(managed.runId);
+      if (!lease) return false;
+      if (this.persistence.load(managed.runId)?.status !== "paused") {
+        this.persistence.releaseRunLease(lease);
+        return false;
+      }
+      managed.lease = lease;
+      return true;
+    } catch {
+      if (lease) this.persistence.releaseRunLease(lease);
+      return false;
+    }
+  }
+
+  /** Acquire ownership before deleting any in-memory run that no longer holds its execution lease. */
+  private acquireRunLeaseForDeletion(managed: ManagedRun): boolean {
+    if (managed.lease) return true;
+
+    let lease: RunLease | null = null;
+    try {
+      lease = this.persistence.acquireRunLease(managed.runId);
+      if (!lease) return false;
+      const persisted = this.persistence.load(managed.runId);
+      if (!persisted || (managed.status === "paused" && persisted.status !== "paused")) {
+        this.persistence.releaseRunLease(lease);
+        return false;
+      }
+      managed.lease = lease;
+      return true;
+    } catch {
+      if (lease) this.persistence.releaseRunLease(lease);
+      return false;
+    }
+  }
+
+  /** Delete a cold persisted run only while holding this process's token-owned lease. */
+  private deletePersistedRunWithLease(runId: string): boolean {
+    let lease: RunLease | null = null;
+    try {
+      lease = this.persistence.acquireRunLease(runId);
+      if (!lease || !this.persistence.load(runId)) return false;
+      return this.persistence.delete(runId, { preserveLock: true });
+    } catch {
+      return false;
+    } finally {
+      if (lease) this.persistence.releaseRunLease(lease);
+    }
   }
 
   /**
@@ -641,12 +1072,14 @@ export class WorkflowManager extends EventEmitter {
   stop(runId: string): boolean {
     const managed = this.runs.get(runId);
     if (!managed || (managed.status !== "running" && managed.status !== "paused")) return false;
+    if (!this.acquireSettledPausedRunLease(managed)) return false;
 
     managed.controller.abort();
     managed.status = "aborted";
+    managed.leaseReleaseBlocked = Boolean(managed.lease);
     this.emit("stopped", { runId });
     this.persistRun(managed);
-    this.releaseRunLease(managed);
+    void this.scheduleCancellationCleanup(managed);
     return true;
   }
 
@@ -675,6 +1108,11 @@ export class WorkflowManager extends EventEmitter {
     return this.persistence.list();
   }
 
+  /** Resolve an explicit report ID without applying navigator session filtering. */
+  getRunForReport(runId: string): PersistedRunState | null {
+    return this.persistence.load(runId);
+  }
+
   /**
    * Get snapshot of a run.
    */
@@ -687,9 +1125,18 @@ export class WorkflowManager extends EventEmitter {
    */
   deleteRun(runId: string): boolean {
     const managed = this.runs.get(runId);
-    if (managed) this.releaseRunLease(managed);
+    if (!managed) return this.deletePersistedRunWithLease(runId);
+    if (!this.acquireRunLeaseForDeletion(managed)) return false;
+    this.deletedRunIds.add(runId);
+    managed.deletionRequested = true;
+    managed.leaseReleaseBlocked = Boolean(managed.lease);
+    managed.controller.abort();
+    // Retain the token during the grace period and, if deletion fails, across
+    // retries so stale running state can never be resumed concurrently.
+    void this.scheduleCancellationCleanup(managed);
+    managed.generation++;
     this.runs.delete(runId);
-    return this.persistence.delete(runId);
+    return this.persistence.delete(runId, { preserveLock: true });
   }
 
   /**

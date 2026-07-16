@@ -144,7 +144,7 @@ describe("registerSavedWorkflow", () => {
     };
     const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-home-"));
     try {
-      registerSavedWorkflow(pi, "/cwd", wf); // no manager
+      registerSavedWorkflow(pi, process.cwd(), wf); // no manager
 
       const { ctx } = makeNotifyCtx();
       await withFakeHomeAsync(fakeHome, () => commands[0].handler("", ctx));
