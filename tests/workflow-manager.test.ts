@@ -1214,23 +1214,21 @@ test(
     const { runId, promise } = manager.startInBackground(oneAgentScript);
     await new Promise((r) => setTimeout(r, 20));
 
-    // Stop first, then delete
     manager.stop(runId);
+    da.resolve("done");
+    await promise.catch(() => {});
     const deleted = manager.deleteRun(runId);
     assert.equal(deleted, true);
 
     const run = manager.getRun(runId);
     assert.equal(run, undefined, "deleted run should not be accessible");
-
-    da.resolve("done");
-    await promise.catch(() => {});
   }),
 );
 
 // ─── deleteRun tests ───────────────────────────────────────────────────────────
 
 test(
-  "deleteRun can delete a running run (removes from memory and persistence)",
+  "deleteRun refuses a running run until its attempt settles",
   withTempCwd(async (cwd) => {
     const da = deferredAgent();
     const manager = new WorkflowManager({ cwd, agent: da.runner });
@@ -1238,22 +1236,18 @@ test(
     const { runId, promise } = manager.startInBackground(oneAgentScript);
     await new Promise((r) => setTimeout(r, 20));
 
-    // Delete while running — should succeed (removes from tracking)
+    assert.equal(manager.deleteRun(runId), false, "active execution ownership prevents cleanup");
+    da.resolve("done");
+    await promise;
     const deleted = manager.deleteRun(runId);
     assert.equal(deleted, true);
-
-    // Should not be in memory
     assert.equal(manager.getRun(runId), undefined);
 
-    // Should not be in persistence
     const runs = manager.listRuns();
     assert.equal(
       runs.find((r) => r.runId === runId),
       undefined,
     );
-
-    da.resolve("done");
-    await promise.catch(() => {});
   }),
 );
 
@@ -1386,8 +1380,11 @@ test(
     const { runId, promise } = manager.startInBackground(oneAgentScript);
     await new Promise((resolve) => setTimeout(resolve, 20));
     manager.pause(runId);
+    const resumePromise = manager.resume(runId);
+    da.resolve("done");
+    await promise.catch(() => {});
 
-    const resumed = await resumeAfterSettlement(manager, runId, promise, () => da.resolve("done"));
+    const resumed = await resumePromise;
     const persisted = manager.listRuns().find((run) => run.runId === runId);
 
     assert.equal(resumed, true);
@@ -1640,6 +1637,9 @@ test(
     assert.equal(manager.pause(runId), true);
     assert.equal(manager.getRun(runId)?.status, "paused");
 
+    da.resolve("settled-before-resume");
+    await origPromise.catch(() => {});
+
     // Mock the agent runner to throw a non-recoverable WorkflowError on resume.
     // Regular Error/agent rejections get wrapped as recoverable (agent returns
     // null, workflow continues). A non-recoverable WorkflowError propagates up
@@ -1712,6 +1712,9 @@ test(
     assert.equal(manager.pause(runId), true, "pause should succeed");
     assert.equal(manager.getRun(runId)?.status, "paused");
 
+    da.resolve("settled-before-resume");
+    await origPromise.catch(() => {});
+
     // Mock agent to throw a non-recoverable WorkflowError, making the run fail
     test.mock.method(da.runner, "run", async (_prompt: string) => {
       throw new WorkflowError("fatal agent error", WorkflowErrorCode.AGENT_EXECUTION_ERROR, { recoverable: false });
@@ -1751,6 +1754,8 @@ test(
     // Pause the running run so we can resume with a failing agent
     assert.equal(manager.pause(runId), true, "pause should succeed");
     assert.equal(manager.getRun(runId)?.status, "paused");
+    da.resolve("settled-before-resume");
+    await origPromise.catch(() => {});
 
     // Mock agent to throw a non-recoverable WorkflowError
     test.mock.method(da.runner, "run", async (_prompt: string) => {
@@ -1791,6 +1796,8 @@ test(
     // Pause the running run
     assert.equal(manager.pause(runId), true, "pause should succeed");
     assert.equal(manager.getRun(runId)?.status, "paused");
+    da.resolve("settled-before-resume");
+    await origPromise.catch(() => {});
 
     // Mock agent to throw a non-recoverable WorkflowError
     test.mock.method(da.runner, "run", async (_prompt: string) => {
@@ -2021,5 +2028,233 @@ test(
     const promptsDuringResume = seen.slice(seenBeforeResume);
     assert.ok(!promptsDuringResume.includes("FIRST"), "agent 1 replayed from journal");
     assert.ok(promptsDuringResume.includes("SECOND-ORIGINAL"), "persisted script's original agent 2 re-ran");
+  }),
+);
+
+// ─── Settled lifecycle and durable execution accounting ───────────────────────
+
+test(
+  "pause retains execution ownership and refuses resume/delete until the active attempt settles",
+  withTempCwd(async (cwd) => {
+    let settle!: () => void;
+    const settled = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    let started!: () => void;
+    const didStart = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(_prompt: string, options: { signal?: AbortSignal }) {
+          started();
+          await settled;
+          if (options.signal?.aborted) throw new Error("settled after abort");
+          return "ok";
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await didStart;
+    const safetyRelease = setTimeout(settle, 100);
+    assert.equal(manager.pause(runId), true);
+    let resumeSettled = false;
+    const resumePromise = manager.resume(runId).then((value) => {
+      resumeSettled = true;
+      return value;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(resumeSettled, false, "resume must wait without overlapping the settling execution");
+    assert.equal(manager.deleteRun(runId), false, "cleanup must not remove a run whose attempt has not settled");
+    const observer = new WorkflowManager({ cwd });
+    assert.equal(observer.deleteRun(runId), false, "another manager must respect the live settlement lease");
+    assert.ok(manager.getRun(runId)?.lease, "the execution lease remains held until settlement");
+
+    clearTimeout(safetyRelease);
+    settle();
+    await promise.catch(() => {});
+    assert.equal(await resumePromise, true, "the replacement starts only after the old generation settles");
+  }),
+);
+
+test(
+  "resume restores execution options and records terminal cumulative budget exhaustion",
+  withTempCwd(async (cwd) => {
+    let firstCalls = 0;
+    const firstManager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(_prompt: string, options: { onUsage?: (usage: AgentUsage) => void }) {
+          firstCalls++;
+          if (firstCalls === 1) {
+            options.onUsage?.({ input: 70, output: 0, total: 70, cost: 0, cacheRead: 0, cacheWrite: 0 });
+            return "first-result";
+          }
+          throw new WorkflowError("provider quota", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+            recoverable: false,
+          });
+        },
+      },
+    });
+    firstManager.on("error", () => {});
+    const script = `export const meta = { name: 'durable_options', description: 'durable options' }
+const first = await agent('first', { label: 'first' })
+const second = await agent('second', { label: 'second' })
+return { first, second }`;
+
+    const { runId, promise } = firstManager.startInBackground(script, undefined, {
+      maxAgents: 2,
+      concurrency: 1,
+      agentRetries: 1,
+      agentTimeoutMs: null,
+      tokenBudget: 100,
+    });
+    await promise.catch(() => {});
+
+    const paused = firstManager.getPersistence().load(runId);
+    assert.deepEqual(paused?.executionOptions, {
+      maxAgents: 2,
+      concurrency: 1,
+      agentRetries: 1,
+      agentTimeoutMs: null,
+      tokenBudget: 100,
+    });
+    assert.equal(paused?.runtimeCheckpoint?.usage.total, 73, "the failed provider attempt is estimated and persisted");
+    const failedAttempt = paused?.runtimeCheckpoint?.attempts["root/call:1"]?.[0];
+    assert.equal(failedAttempt?.status, "failed");
+    assert.equal(failedAttempt?.usage.accounting.estimated, 3);
+    assert.equal(paused?.agents.find((agent) => agent.label === "first")?.tokens, 70);
+
+    let resumeCalls = 0;
+    const secondManager = new WorkflowManager({
+      cwd,
+      concurrency: 8,
+      defaultAgentRetries: 0,
+      defaultAgentTimeoutMs: 1,
+      agent: {
+        async run(_prompt: string, options: { onUsage?: (usage: AgentUsage) => void }) {
+          resumeCalls++;
+          const total = resumeCalls === 1 ? 10 : 20;
+          options.onUsage?.({ input: total, output: 0, total, cost: 0, cacheRead: 0, cacheWrite: 0 });
+          return resumeCalls === 1 ? "" : "second-result";
+        },
+      },
+    });
+    secondManager.on("error", () => {});
+
+    assert.equal(await secondManager.resume(runId), true);
+    const resumed = secondManager.getRun(runId);
+    await assert.rejects(
+      resumed?.execution,
+      (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED,
+    );
+
+    assert.equal(resumeCalls, 2, "the persisted retry setting overrides the new manager default");
+    assert.equal(secondManager.getRun(runId)?.status, "failed");
+    const failed = secondManager.getPersistence().load(runId);
+    assert.equal(failed?.tokenUsage?.total, 103, "pre-resume spend is charged exactly once and overshoot is retained");
+    assert.equal(failed?.runtimeCheckpoint?.usage.accounting.journalReplay, 70);
+    assert.equal(failed?.agents.find((agent) => agent.label === "first")?.tokens, 70);
+    assert.equal(failed?.agents.find((agent) => agent.label === "second")?.tokens, 33);
+    assert.equal(failed?.runtimeCheckpoint?.attempts["root/call:1"]?.length, 3);
+  }),
+);
+
+test(
+  "live measured failure telemetry persists before and after attempt settlement",
+  withTempCwd(async (cwd) => {
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let observed!: () => void;
+    const usageObserved = new Promise<void>((resolve) => {
+      observed = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(_prompt: string, options: { onUsageUpdate?: (usage: AgentUsage) => void }) {
+          options.onUsageUpdate?.({
+            input: 50,
+            output: 20,
+            total: 75,
+            cost: 0.02,
+            cacheRead: 5,
+            cacheWrite: 0,
+            reasoning: 6,
+          });
+          observed();
+          await released;
+          throw new WorkflowError("fatal after usage", WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
+            recoverable: false,
+          });
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await usageObserved;
+
+    const active = manager.getPersistence().load(runId)?.runtimeCheckpoint;
+    assert.equal(active?.usage.total, 75);
+    assert.equal(active?.usage.accounting.measured, 75);
+    assert.equal(active?.usage.accounting.reasoning.tokens, 6);
+    assert.equal(active?.attempts["root/call:0"]?.[0]?.status, "running");
+
+    release();
+    await promise.catch(() => {});
+
+    const failed = manager.getPersistence().load(runId)?.runtimeCheckpoint;
+    assert.equal(failed?.usage.total, 75, "settlement must not double-charge the final cumulative sample");
+    assert.equal(failed?.attempts["root/call:0"]?.[0]?.status, "failed");
+    assert.equal(failed?.attempts["root/call:0"]?.[0]?.usage.accounting.measured, 75);
+  }),
+);
+
+test(
+  "legacy persisted usage and numeric journal entries remain cumulative on resume",
+  withTempCwd(async (cwd) => {
+    const firstManager = new WorkflowManager({ cwd, agent: fakeAgent({ input: 40, total: 40 }) });
+    await firstManager.runSync(oneAgentScript);
+    const runId = firstManager.listRuns()[0]?.runId;
+    assert.ok(runId);
+    const legacy = firstManager.getPersistence().load(runId);
+    assert.ok(legacy);
+    legacy.status = "paused";
+    legacy.tokenUsage = { input: 40, output: 0, total: 40, cost: 0, cacheRead: 0, cacheWrite: 0 };
+    delete legacy.schemaVersion;
+    delete legacy.executionOptions;
+    delete legacy.runtimeCheckpoint;
+    for (const entry of legacy.journal ?? []) {
+      delete entry.key;
+      delete entry.kind;
+      delete entry.usage;
+      delete entry.tokens;
+      delete entry.agentCount;
+    }
+    firstManager.getPersistence().save(legacy);
+
+    const secondManager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          throw new Error("legacy journal should replay without live work");
+        },
+      },
+    });
+    secondManager.on("error", () => {});
+
+    assert.equal(await secondManager.resume(runId), true);
+    await secondManager.getRun(runId)?.execution;
+
+    const completed = secondManager.getPersistence().load(runId);
+    assert.equal(completed?.status, "completed");
+    assert.equal(completed?.tokenUsage?.total, 40, "legacy cumulative usage must survive schema migration on resume");
+    assert.equal(completed?.runtimeCheckpoint?.usage.accounting.legacyUnclassified, 40);
   }),
 );

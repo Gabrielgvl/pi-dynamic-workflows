@@ -250,6 +250,37 @@ The default `workflow` also matches `workflows`; a custom word matches exactly. 
 
 Workflow scripts run in a Node `vm` sandbox. `Date.now()`, `Math.random()`, `new Date()`, `require`, `import`, filesystem access, and network access are unavailable inside the orchestration script. Subagents use their assigned tools; keeping the orchestrator deterministic is what makes journal replay reliable.
 
+### Durable accounting, retries, and nested workflow identity
+
+| Global | What it does |
+| --- | --- |
+| `agent(prompt, opts)` | Spawn an isolated subagent. Returns its final text, or a validated object with `opts.schema`; recoverable failures return `null` with diagnostics in `/workflows`. |
+| `parallel(thunks)` | Run `() => agent(...)` thunks concurrently; results in input order. |
+| `pipeline(items, ...stages)` | Fan items through sequential stages `(prev, original, index)`. |
+| `phase(title, { budget? })` | Group agents in the live view; optional per-phase token sub-budget. |
+| `verify` / `judgePanel` / `loopUntilDry` / `completenessCheck` | Built-in quality patterns. |
+| `workflow(nameOrScript, args?, { key? })` | Run a saved or raw workflow inline (shares global caps). Identical siblings require unique explicit keys. |
+| `checkpoint(prompt, opts)` | A journaled, replayable human approval gate. |
+| `budget` | `{ total, spent(), remaining() }` real-token tracker. |
+
+| Agent option | Description |
+| --- | --- |
+| `tier` | `"small"` \| `"medium"` \| `"big"` — coarse model routing (configure via `/workflows-models`; tiers may store `provider/modelId:thinking`). |
+| `model` | Exact `provider/modelId` or `provider/modelId:thinking` (always wins over `tier`). |
+| `agentType` | A named definition (`.pi/agents/<name>.md` project-level, or `~/.pi/agent/agents/<name>.md` user-level — `~/.pi/agents/<name>.md` still works as a deprecated fallback) binding tools + model + role prompt. |
+| `isolation: "worktree"` | Run in a throwaway git worktree for conflict-free parallel edits. |
+| `schema` | JSON Schema → the subagent returns a validated object. |
+| `label` / `phase` / `timeoutMs` | Display label / phase override / optional per-agent hard timeout. Omit `timeoutMs` for no hard timeout. |
+| `retries` | Retry attempts after a recoverable failure for this agent. Overrides the run-level `agentRetries`. A timed-out attempt is aborted and fully settled before any retry starts. Default `0`. |
+
+By default, workflows do not set a run-wide token ceiling or per-agent hard timeout. `tokenBudget` and `phase(..., { budget })` are strengthened best-effort ceilings, not billing-hard caps: admission is checked immediately before each live attempt, charges survive resume, active attempts are cancelled when live usage reaches a ceiling, and delayed provider telemetry can still produce an honestly reported overshoot. Budget exhaustion is terminal when the script otherwise succeeds or catches/consumes an agent failure; an unrelated uncaught script error remains the primary failure, and an explicit parent abort remains terminal. Journal replay remains zero-cost. Use `agentTimeoutMs` or per-agent `timeoutMs` only when you want an explicit time bound. On timeout, the attempt is aborted and the runtime waits for it to settle before retrying, releasing its lease, cleaning up its worktree, or allowing resume; after configured retries are exhausted, `agent()` returns `null` like other recoverable failures. A non-cooperative custom agent can therefore keep the run blocked, but a caught or exhausted timeout does not make the whole logical run terminal by itself. A global fallback timeout can be set in `~/.pi/workflows/settings.json` as `{ "defaultAgentTimeoutMs": 600000 }`; set it to `null` or omit it for no default hard timeout.
+
+Nested calls accept `workflow(nameOrScript, args?, { key?: string })`. The key is trimmed and must be non-empty. Within one parent, explicit keys must be unique; without a key, the typed canonical saved-name/raw-script plus arguments identity may occur only once. Canonical identity distinguishes omitted, `undefined`, `null`, special numbers, arrays, objects, and nested marker-like values while sorting object keys; cyclic values, functions, symbols, bigint values, and other unsupported argument shapes fail with a script-validation error instead of sharing a hash. Use keys for identical siblings and for reorder/insertion-stable accounting. Existing unambiguous unkeyed occurrence-0 accounting remains compatible, but keyed children start fresh rather than guessing charges from ambiguous legacy occurrences.
+
+Duplicate sibling identity is enforced dynamically as each `workflow()` call is reached, not as a pre-execution whole-script guarantee. A previously completed keyed child may therefore already have durable descendant/wrapper checkpoints before a later duplicate is detected; those checkpoints are intentionally retained for incremental crash recovery, with no phase or usage charge transfer to the duplicate. Keyed descendant journals carry stable accounting-call identity, so if a child fails before its wrapper checkpoint, resume can still replay its completed child calls and execute only the unfinished suffix. Wrapper checkpoints remain positional, and child journals are persisted incrementally rather than staged behind a two-pass preflight.
+
+For larger or flakier fan-outs, the `workflow` tool also accepts `concurrency` (max agents running at once, clamped to the runtime maximum of `16`) and `agentRetries` (retry attempts after a recoverable failure). Both can be defaulted in `~/.pi/workflows/settings.json` as `{ "defaultConcurrency": 4, "defaultAgentRetries": 2 }`; a per-run tool value overrides the default, and a per-agent `retries` overrides `agentRetries`. Retries default to `0` (off) unless configured or passed. Timeouts abort and fully settle before a configured retry; nonrecoverable errors abort the run.
+
 Journal replay — including edit-and-resume via `resumeFromRunId` — matches cached agent results by **positional call index** (the order in which `agent()` calls execute), the same contract Claude Code uses. Editing an `agent()` prompt in place reuses the cache up to that call and re-runs it and everything after. Inserting, removing, or reordering an `agent()` call before others shifts their positions and invalidates the cache from that point on (mismatched calls simply re-run — no crash). To preserve the cached prefix, keep the earlier still-good `agent()` calls unchanged and in the same order.
 
 ## Development

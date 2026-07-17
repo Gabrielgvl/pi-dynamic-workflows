@@ -2,6 +2,8 @@
  * Workflow-specific error types.
  */
 
+import type { TokenUsage } from "./usage.js";
+
 export enum WorkflowErrorCode {
   /** Agent exceeded timeout. */
   AGENT_TIMEOUT = "AGENT_TIMEOUT",
@@ -38,19 +40,33 @@ export class WorkflowError extends Error {
   readonly details?: unknown;
   /** For PROVIDER_USAGE_LIMIT: the provider's human reset hint, e.g. "Resets in ~3h" (verbatim). */
   readonly resetHint?: string;
+  /** Actual cumulative usage when a best-effort token ceiling is exhausted. */
+  readonly usage?: TokenUsage;
+  /** Delayed-provider overshoot beyond the configured best-effort ceiling. */
+  readonly overshoot?: number;
 
   constructor(
     message: string,
     code: WorkflowErrorCode,
-    options: { recoverable?: boolean; agentLabel?: string; details?: unknown; resetHint?: string } = {},
+    options: {
+      recoverable?: boolean;
+      agentLabel?: string;
+      details?: unknown;
+      resetHint?: string;
+      usage?: TokenUsage;
+      overshoot?: number;
+      cause?: unknown;
+    } = {},
   ) {
-    super(message);
+    super(message, options.cause === undefined ? undefined : { cause: options.cause });
     this.name = "WorkflowError";
     this.code = code;
     this.recoverable = options.recoverable ?? false;
     this.agentLabel = options.agentLabel;
     this.details = options.details;
     this.resetHint = options.resetHint;
+    this.usage = options.usage;
+    this.overshoot = options.overshoot;
   }
 }
 

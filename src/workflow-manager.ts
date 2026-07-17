@@ -5,8 +5,8 @@
 import { EventEmitter } from "node:events";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { WorkflowAgent } from "./agent.js";
-import { MAX_AGENTS_PER_RUN } from "./config.js";
-import { preview, type WorkflowSnapshot } from "./display.js";
+import { MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CONCURRENCY } from "./config.js";
+import { preview, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import { WorkflowError, WorkflowErrorCode } from "./errors.js";
 import {
   createRunPersistence,
@@ -15,11 +15,13 @@ import {
   LEGACY_EXECUTION_OPTIONS,
   type PersistedExecutionOptions,
   type PersistedRunState,
+  type ResolvedExecutionOptions,
   type RunLease,
   type RunPersistence,
   type RunStatus,
   type TerminalSnapshot,
 } from "./run-persistence.js";
+import { type RuntimeCheckpoint, restoreTokenUsage } from "./usage.js";
 import { type JournalEntry, parseWorkflowScript, runWorkflow, type WorkflowRunResult } from "./workflow.js";
 import { canonicalWorkflowCwd, workflowProjectKey } from "./workflow-paths.js";
 
@@ -37,7 +39,7 @@ export interface ManagedRun {
   /** Accumulated agent results for resume (deterministic call index -> result). */
   journal: JournalEntry[];
   /** Canonical execution options captured once and reused verbatim on resume. */
-  executionOptions: PersistedExecutionOptions;
+  executionOptions?: PersistedExecutionOptions;
   /** Immutable session provenance. */
   originSessionId?: string;
   /** Session that requested the current execution and receives background delivery. */
@@ -45,10 +47,14 @@ export interface ManagedRun {
   /** Created once for a terminal transition and reused by later persistence writes. */
   terminalSnapshot?: TerminalSnapshot;
   terminalAt?: string;
-  /** Cross-process execution lease for this run, when it is actively executing. */
+  /** Cross-process execution lease for this run, held through attempt settlement. */
   lease?: RunLease;
+  /** Active execution promise retained for compatibility and safe delete fencing. */
+  execution?: Promise<WorkflowRunResult>;
   /** Settlement of this exact execution generation; replacements await it. */
   settlement?: Promise<unknown>;
+  /** Durable cumulative usage, attempts, and phase-budget state. */
+  runtimeCheckpoint?: RuntimeCheckpoint;
   /**
    * True when the run was started in the background (or resumed) and the caller is
    * not awaiting its result inline. Only background runs deliver their result back
@@ -67,7 +73,7 @@ export interface ManagedRun {
 /** Per-execution options shared by sync, background, and resume runs. */
 export interface ExecOptions {
   /** Replay these journaled agent results for the unchanged prefix (resume). */
-  resumeJournal?: Map<number, JournalEntry>;
+  resumeJournal?: Map<string | number, JournalEntry>;
   /** Cap on total agents for this run. */
   maxAgents?: number;
   /** Per-agent timeout in milliseconds. null/omitted means no hard timeout. */
@@ -76,7 +82,7 @@ export interface ExecOptions {
   externalSignal?: AbortSignal;
   /** Called with the live snapshot on every progress event. */
   onProgress?: (snapshot: WorkflowSnapshot) => void;
-  /** Hard token budget for this run; once spent reaches it, agent() throws. */
+  /** Best-effort token ceiling; delayed provider telemetry can overshoot. */
   tokenBudget?: number | null;
   /** Max concurrent agents for this execution. */
   concurrency?: number;
@@ -274,6 +280,7 @@ export class WorkflowManager extends EventEmitter {
       : "";
     const runId = slug ? `${slug}-${generateRunId()}` : generateRunId();
     const controller = new AbortController();
+    const executionOptions = this.resolveExecutionOptions(exec);
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) throw new Error(`Could not acquire workflow run lease for ${runId}`);
 
@@ -296,7 +303,7 @@ export class WorkflowManager extends EventEmitter {
       script,
       args,
       journal: [],
-      executionOptions: this.resolveExecutionOptions(exec),
+      executionOptions,
       originSessionId: this.sessionId,
       deliverySessionId: this.sessionId,
       background: true,
@@ -321,6 +328,7 @@ export class WorkflowManager extends EventEmitter {
     // The original promise is returned so callers can await it in try/catch.
     const promise = this.executeRun(managed, script, args, exec);
     managed.settlement = promise;
+    managed.execution = promise;
     promise.catch(() => {});
 
     return { runId, promise };
@@ -342,7 +350,10 @@ export class WorkflowManager extends EventEmitter {
     // Persist the initial state immediately so listRuns()/the task panel can see
     // the run the moment it starts, not only after the first agent journals.
     this.persistRun(managed);
-    return this.executeRun(managed, script, args, exec);
+    const execution = this.executeRun(managed, script, args, exec);
+    managed.execution = execution;
+    managed.settlement = execution;
+    return execution;
   }
 
   /** Build a fresh managed run with an empty snapshot. */
@@ -382,11 +393,14 @@ export class WorkflowManager extends EventEmitter {
     };
   }
 
-  private resolveExecutionOptions(exec: ExecOptions): PersistedExecutionOptions {
+  private resolveExecutionOptions(exec: ExecOptions): ResolvedExecutionOptions {
+    const concurrency = exec.concurrency ?? this.concurrency;
+    const retries = exec.agentRetries ?? this.defaultAgentRetries;
+    const maxAgents = exec.maxAgents ?? MAX_AGENTS_PER_RUN;
     return {
-      maxAgents: exec.maxAgents ?? MAX_AGENTS_PER_RUN,
-      concurrency: exec.concurrency ?? this.concurrency,
-      agentRetries: exec.agentRetries ?? this.defaultAgentRetries,
+      maxAgents: Math.min(MAX_AGENTS_PER_RUN, Math.max(1, Math.floor(maxAgents))),
+      concurrency: Math.min(MAX_CONCURRENCY, Math.max(1, Math.floor(concurrency))),
+      agentRetries: Math.min(MAX_AGENT_RETRIES, Math.max(0, Math.floor(retries))),
       agentTimeoutMs: exec.agentTimeoutMs !== undefined ? exec.agentTimeoutMs : this.defaultAgentTimeoutMs,
       tokenBudget: exec.tokenBudget ?? null,
     };
@@ -399,21 +413,17 @@ export class WorkflowManager extends EventEmitter {
     exec: ExecOptions = {},
   ): Promise<WorkflowRunResult> {
     const { resumeJournal, externalSignal, onProgress, confirm } = exec;
-    const {
-      maxAgents,
-      agentTimeoutMs: resolvedAgentTimeoutMs,
-      tokenBudget,
-      concurrency: resolvedConcurrency,
-      agentRetries: resolvedAgentRetries,
-    } = managed.executionOptions;
-    const ownsGeneration = () =>
-      this.runs.get(managed.runId) === managed &&
-      managed.status === "running" &&
-      !!managed.lease &&
-      this.persistence.ownsRunLease(managed.lease);
+    const executionOptions = managed.executionOptions ?? this.resolveExecutionOptions(exec);
+    managed.executionOptions = executionOptions;
+    const { maxAgents, agentTimeoutMs, tokenBudget, concurrency, agentRetries } = executionOptions;
+    const ownsLeaseGeneration = () =>
+      this.runs.get(managed.runId) === managed && !!managed.lease && this.persistence.ownsRunLease(managed.lease);
+    const ownsGeneration = () => ownsLeaseGeneration() && managed.status === "running";
     const progress = () => {
       if (ownsGeneration()) onProgress?.(managed.snapshot);
     };
+    const restoredAgentRows = resumeJournal ? new Set(managed.snapshot.agents) : undefined;
+    const observedAgentRows = new Set<WorkflowAgentSnapshot>();
     // Let a host abort (e.g. Esc during a blocking tool call) cancel this run.
     if (externalSignal) {
       if (externalSignal.aborted) managed.controller.abort();
@@ -433,25 +443,53 @@ export class WorkflowManager extends EventEmitter {
         modelRegistry: this.modelRegistry,
         persistAgentSessions: this.persistAgentSessions,
         signal: managed.controller.signal,
-        concurrency: resolvedConcurrency,
-        agentRetries: resolvedAgentRetries,
+        concurrency,
+        agentRetries,
         maxAgents,
-        agentTimeoutMs: resolvedAgentTimeoutMs,
-        // Keep the original ceiling and seed the fresh runtime with persisted
-        // cumulative accounting. Replay costs zero; only new work consumes more.
+        agentTimeoutMs,
         tokenBudget,
         initialTokenUsage: managed.snapshot.tokenUsage,
         initialTokenSpend: managed.snapshot.tokenUsage?.total ?? 0,
         confirm,
         loadSavedWorkflow: this.loadSavedWorkflow,
         resumeJournal,
+        runtimeCheckpoint: managed.runtimeCheckpoint,
         resumeFromRunId: resumeJournal ? managed.runId : undefined,
         onAgentJournal: (entry) => {
           if (!ownsGeneration()) return;
-          // Append (crash-safe-ish): keep the latest entry per index, then persist.
-          managed.journal = managed.journal.filter((e) => e.index !== entry.index);
+          // Stable logical identities survive keyed physical reorders. Supersede
+          // only the same logical entry; retain colliding descendants needed for
+          // partial child resume.
+          managed.journal = managed.journal.filter((existing) => !journalEntrySupersededBy(existing, entry));
           managed.journal.push(entry);
           this.persistRun(managed);
+        },
+        onJournalReplay: (entry) => {
+          if (!ownsGeneration() || !restoredAgentRows || entry.kind !== "workflow" || !entry.accountingScopeKey) return;
+          const exactDescendants = entry.descendantAgentAccountingCallKeys;
+          if (exactDescendants !== undefined) {
+            const exactIdentities = new Set(exactDescendants);
+            for (const agent of restoredAgentRows) {
+              if (agent.accountingCallKey && exactIdentities.has(agent.accountingCallKey)) observedAgentRows.add(agent);
+            }
+            return;
+          }
+
+          // Legacy wrappers did not persist an exact generation membership list.
+          // Preserve compatible scoped rows on their first replay rather than
+          // guessing which valid descendants should be deleted.
+          const childCallPrefix = `${entry.accountingScopeKey}/call:`;
+          for (const agent of restoredAgentRows) {
+            if (agent.accountingCallKey?.startsWith(childCallPrefix)) observedAgentRows.add(agent);
+          }
+        },
+        onRuntimeCheckpoint: (checkpoint) => {
+          if (!ownsLeaseGeneration()) return;
+          managed.runtimeCheckpoint = checkpoint;
+          managed.snapshot.tokenUsage = checkpoint.usage;
+          this.persistRun(managed);
+          this.emit("tokenUsage", { runId: managed.runId, usage: checkpoint.usage });
+          progress();
         },
         onLog: (message) => {
           if (!ownsGeneration()) return;
@@ -466,26 +504,64 @@ export class WorkflowManager extends EventEmitter {
             managed.snapshot.phases.push(title);
           }
           this.emit("phase", { runId: managed.runId, title });
+          this.persistRun(managed);
           progress();
         },
         onAgentStart: (event) => {
           if (!ownsGeneration()) return;
-          managed.snapshot.agents.push({
-            id: managed.snapshot.agents.length + 1,
-            label: event.label,
-            phase: event.phase,
-            prompt: event.prompt,
-            status: "running",
-            model: event.model,
-          });
+          const existing =
+            (event.accountingCallKey
+              ? managed.snapshot.agents.find((agent) => agent.accountingCallKey === event.accountingCallKey)
+              : undefined) ??
+            (event.key ? managed.snapshot.agents.find((agent) => agent.key === event.key) : undefined) ??
+            (event.replayed
+              ? managed.snapshot.agents.find(
+                  (agent) =>
+                    agent.label === event.label && agent.phase === event.phase && agent.prompt === event.prompt,
+                )
+              : undefined);
+          if (existing) {
+            existing.label = event.label;
+            existing.phase = event.phase;
+            existing.prompt = event.prompt;
+            existing.key = event.key;
+            existing.accountingCallKey = event.accountingCallKey;
+            if (event.model) existing.model = event.model;
+            if (!event.replayed) {
+              existing.status = "running";
+              existing.error = undefined;
+              existing.errorCode = undefined;
+              existing.recoverable = undefined;
+            }
+          } else {
+            managed.snapshot.agents.push({
+              id: managed.snapshot.agents.length + 1,
+              label: event.label,
+              phase: event.phase,
+              prompt: event.prompt,
+              status: event.replayed ? "done" : "running",
+              model: event.model,
+              key: event.key,
+              accountingCallKey: event.accountingCallKey,
+            });
+          }
+          const observed = existing ?? managed.snapshot.agents.at(-1);
+          if (observed) observedAgentRows.add(observed);
+          refreshSnapshotCounts(managed.snapshot);
           this.emit("agentStart", { runId: managed.runId, ...event });
+          this.persistRun(managed);
           progress();
         },
         onAgentEnd: (event) => {
           if (!ownsGeneration()) return;
-          const agent = [...managed.snapshot.agents]
-            .reverse()
-            .find((a) => a.label === event.label && a.status === "running");
+          const agent =
+            (event.accountingCallKey
+              ? managed.snapshot.agents.find((candidate) => candidate.accountingCallKey === event.accountingCallKey)
+              : undefined) ??
+            (event.key ? managed.snapshot.agents.find((candidate) => candidate.key === event.key) : undefined) ??
+            [...managed.snapshot.agents]
+              .reverse()
+              .find((candidate) => candidate.label === event.label && candidate.status === "running");
           if (agent) {
             agent.status = event.result === null ? "error" : "done";
             agent.resultPreview = preview(event.result);
@@ -493,39 +569,31 @@ export class WorkflowManager extends EventEmitter {
             agent.errorCode = event.errorCode;
             agent.recoverable = event.recoverable;
             agent.tokens = event.tokens;
-            if (event.tokenUsage) {
-              agent.tokenUsage = event.tokenUsage;
-              const prior = managed.snapshot.tokenUsage ?? {
-                input: 0,
-                output: 0,
-                total: 0,
-                cost: 0,
-                cacheRead: 0,
-                cacheWrite: 0,
-              };
-              managed.snapshot.tokenUsage = {
-                input: prior.input + event.tokenUsage.input,
-                output: prior.output + event.tokenUsage.output,
-                total: prior.total + event.tokenUsage.total,
-                cost: (prior.cost ?? 0) + (event.tokenUsage.cost ?? 0),
-                cacheRead: (prior.cacheRead ?? 0) + (event.tokenUsage.cacheRead ?? 0),
-                cacheWrite: (prior.cacheWrite ?? 0) + (event.tokenUsage.cacheWrite ?? 0),
-              };
-            }
+            agent.tokenUsage = event.tokenUsage;
             if (event.model) agent.model = event.model;
+            agent.key = event.key;
+            agent.accountingCallKey = event.accountingCallKey;
           }
+          refreshSnapshotCounts(managed.snapshot);
           this.emit("agentEnd", { runId: managed.runId, ...event });
+          this.persistRun(managed);
           progress();
         },
         onAgentHistory: (event) => {
           if (!ownsGeneration()) return;
-          const agent = [...managed.snapshot.agents]
-            .reverse()
-            .find((a) => a.label === event.label && a.status === "running");
+          const agent =
+            (event.accountingCallKey
+              ? managed.snapshot.agents.find((candidate) => candidate.accountingCallKey === event.accountingCallKey)
+              : undefined) ??
+            (event.key ? managed.snapshot.agents.find((candidate) => candidate.key === event.key) : undefined) ??
+            [...managed.snapshot.agents]
+              .reverse()
+              .find((candidate) => candidate.label === event.label && candidate.status === "running");
           if (agent) {
             agent.history = event.history;
           }
           this.emit("agentHistory", { runId: managed.runId, ...event });
+          this.persistRun(managed);
           progress();
         },
         onTokenUsage: (usage) => {
@@ -549,10 +617,16 @@ export class WorkflowManager extends EventEmitter {
       // The public/control-plane run ID is the persisted manager ID. Keep the
       // runtime's legacy internal run-* identifier for subagent session names.
       result.runId = managed.runId;
-      if (managed.status !== "running" || !managed.lease || !this.persistence.ownsRunLease(managed.lease)) {
+      if (!ownsGeneration()) {
         throw new WorkflowError("Workflow execution no longer owns its run lease", WorkflowErrorCode.WORKFLOW_ABORTED, {
           recoverable: true,
         });
+      }
+      if (restoredAgentRows) {
+        managed.snapshot.agents = managed.snapshot.agents.filter(
+          (agent) => !restoredAgentRows.has(agent) || observedAgentRows.has(agent),
+        );
+        refreshSnapshotCounts(managed.snapshot);
       }
       managed.status = "completed";
       managed.result = result;
@@ -566,13 +640,19 @@ export class WorkflowManager extends EventEmitter {
 
       return result;
     } catch (error) {
-      const workflowError =
-        error instanceof WorkflowError
+      const workflowError = managed.controller.signal.aborted
+        ? error instanceof WorkflowError && error.code === WorkflowErrorCode.WORKFLOW_ABORTED
+          ? error
+          : new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, {
+              recoverable: true,
+              cause: error,
+            })
+        : error instanceof WorkflowError && error.code !== WorkflowErrorCode.WORKFLOW_ABORTED
           ? error
           : new WorkflowError(
               error instanceof Error ? error.message : String(error),
-              WorkflowErrorCode.WORKFLOW_ABORTED,
-              { recoverable: true },
+              WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+              { recoverable: false, details: error, cause: error },
             );
 
       const usageLimitPaused =
@@ -609,15 +689,18 @@ export class WorkflowManager extends EventEmitter {
         this.emit("error", { runId: managed.runId, error: workflowError });
       }
 
-      // pause()/stop() persist their transition before releasing the lease. Their
-      // aborted execution may settle later; never let that stale catch overwrite a
-      // resumed owner that acquired the lease in the meantime.
+      // pause()/stop() persist their transition while this execution retains the
+      // lease. Final callbacks may still report usage/checkpoints during abort
+      // settlement, so only this catch/finally releases ownership after they drain.
       if (managed.lease && this.persistence.ownsRunLease(managed.lease)) {
         this.persistRun(managed);
         this.releaseRunLease(managed);
       }
 
       throw workflowError;
+    } finally {
+      this.releaseRunLease(managed);
+      managed.execution = undefined;
     }
   }
 
@@ -629,6 +712,8 @@ export class WorkflowManager extends EventEmitter {
 
   private toPersistedState(managed: ManagedRun): PersistedRunState {
     return {
+      version: 2,
+      schemaVersion: 2,
       runId: managed.runId,
       cwd: this.cwd,
       projectKey: workflowProjectKey(this.cwd),
@@ -640,7 +725,8 @@ export class WorkflowManager extends EventEmitter {
       sessionId: managed.originSessionId,
       originSessionId: managed.originSessionId,
       deliverySessionId: managed.deliverySessionId,
-      executionOptions: { ...managed.executionOptions },
+      executionOptions: managed.executionOptions ? { ...managed.executionOptions } : undefined,
+      runtimeCheckpoint: managed.runtimeCheckpoint,
       journal: managed.journal,
       status: managed.status,
       // Fixed at run start and retained across manual and automatic resumes.
@@ -664,16 +750,7 @@ export class WorkflowManager extends EventEmitter {
       })),
       logs: managed.snapshot.logs,
       result: managed.result?.result,
-      tokenUsage: managed.snapshot.tokenUsage
-        ? {
-            input: managed.snapshot.tokenUsage.input,
-            output: managed.snapshot.tokenUsage.output,
-            total: managed.snapshot.tokenUsage.total,
-            cost: managed.snapshot.tokenUsage.cost,
-            cacheRead: managed.snapshot.tokenUsage.cacheRead,
-            cacheWrite: managed.snapshot.tokenUsage.cacheWrite,
-          }
-        : undefined,
+      tokenUsage: managed.snapshot.tokenUsage ? structuredClone(managed.snapshot.tokenUsage) : undefined,
       startedAt: managed.startedAt.toISOString(),
       updatedAt: managed.terminalAt ?? new Date().toISOString(),
       completedAt: managed.status === "completed" ? managed.terminalAt : undefined,
@@ -755,7 +832,6 @@ export class WorkflowManager extends EventEmitter {
       }
       if (this.runs.get(runId)?.status === "aborted") return false;
     }
-
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) return false;
     const persisted = this.persistence.load(runId);
@@ -776,19 +852,47 @@ export class WorkflowManager extends EventEmitter {
     const args = explicit?.args !== undefined ? explicit.args : persisted.args;
 
     const controller = new AbortController();
+    const runtimeCheckpoint =
+      persisted.runtimeCheckpoint ??
+      (persisted.tokenUsage
+        ? {
+            schemaVersion: 1 as const,
+            usage: restoreTokenUsage(persisted.tokenUsage),
+            phaseBudgets: {},
+            attempts: {},
+          }
+        : undefined);
+    const restoredAgents = (persisted.agents ?? []).map((agent) => ({
+      id: agent.id,
+      label: agent.label,
+      phase: agent.phase,
+      prompt: agent.prompt,
+      status: agent.status,
+      resultPreview: agent.resultPreview ?? (agent.result === undefined ? undefined : preview(agent.result)),
+      error: agent.error,
+      errorCode: agent.errorCode,
+      recoverable: agent.recoverable,
+      history: agent.history,
+      model: agent.model,
+      tokens: agent.tokens,
+      tokenUsage: agent.tokenUsage,
+      key: agent.key,
+      accountingCallKey: agent.accountingCallKey,
+    }));
     const managed: ManagedRun = {
       runId,
       status: "running",
       snapshot: {
         name: persisted.workflowName,
         phases: persisted.phases ?? [],
+        currentPhase: persisted.currentPhase,
         logs: persisted.logs ?? [],
-        agents: [],
-        agentCount: 0,
-        runningCount: 0,
-        doneCount: 0,
-        errorCount: 0,
-        tokenUsage: persisted.tokenUsage ? { ...persisted.tokenUsage } : undefined,
+        agents: restoredAgents,
+        tokenUsage: runtimeCheckpoint?.usage ?? persisted.tokenUsage,
+        agentCount: restoredAgents.length,
+        runningCount: restoredAgents.filter((agent) => agent.status === "running").length,
+        doneCount: restoredAgents.filter((agent) => agent.status === "done").length,
+        errorCount: restoredAgents.filter((agent) => agent.status === "error").length,
       },
       controller,
       startedAt: validDate(persisted.startedAt),
@@ -806,17 +910,19 @@ export class WorkflowManager extends EventEmitter {
       // Carry the original opt-out forward across resumes; it's fixed at
       // run-start and persistRun() re-persists it on every subsequent write.
       autoResume: persisted.autoResume,
+      runtimeCheckpoint,
     };
     this.runs.set(runId, managed);
     // Persist before notifying renderers: listRuns() is their source of truth for
     // lifecycle status, while getRun() supplies the live in-memory snapshot.
     this.persistRun(managed);
 
-    const resumeJournal = new Map((persisted.journal ?? []).map((e) => [e.index, e] as const));
+    const resumeJournal = createResumeJournal(persisted.journal ?? []);
     this.emit("resumed", { runId });
     // Run in the background; executeRun records status/errors on the managed run.
     const settlement = this.executeRun(managed, script, args, { resumeJournal });
     managed.settlement = settlement;
+    managed.execution = settlement;
     void settlement.catch(() => {});
     return true;
   }
@@ -843,7 +949,8 @@ export class WorkflowManager extends EventEmitter {
       this.ensureTerminalSnapshot(managed, { reason: "stopped" });
       this.emit("stopped", { runId });
       this.persistRun(managed);
-      this.releaseRunLease(managed);
+      // executeRun retains this lease until the aborted attempt and all descendant
+      // operations settle, including any late final usage/checkpoint callbacks.
       return true;
     }
 
@@ -997,9 +1104,15 @@ export class WorkflowManager extends EventEmitter {
    */
   deleteRun(runId: string): boolean {
     const managed = this.runs.get(runId);
-    if (managed) this.releaseRunLease(managed);
-    this.runs.delete(runId);
-    return this.persistence.delete(runId);
+    if (managed?.execution || managed?.lease) return false;
+    const lease = this.persistence.acquireRunLease(runId);
+    if (!lease) return false;
+    try {
+      this.runs.delete(runId);
+      return this.persistence.delete(runId);
+    } finally {
+      this.persistence.releaseRunLease(lease);
+    }
   }
 
   /**
@@ -1097,4 +1210,49 @@ export class WorkflowManagerRegistry {
     this.onCreate?.(manager, canonicalCwd);
     return manager;
   }
+}
+
+function refreshSnapshotCounts(snapshot: WorkflowSnapshot): void {
+  snapshot.agentCount = snapshot.agents.length;
+  snapshot.runningCount = snapshot.agents.filter((agent) => agent.status === "running").length;
+  snapshot.doneCount = snapshot.agents.filter((agent) => agent.status === "done").length;
+  snapshot.errorCount = snapshot.agents.filter((agent) => agent.status === "error").length;
+}
+
+function journalEntrySupersededBy(existing: JournalEntry, replacement: JournalEntry): boolean {
+  const sameKind = existing.kind === replacement.kind;
+  if (
+    replacement.kind === "workflow" &&
+    replacement.accountingScopeKey !== undefined &&
+    sameKind &&
+    existing.accountingScopeKey === replacement.accountingScopeKey
+  ) {
+    return true;
+  }
+  if (
+    replacement.accountingCallKey !== undefined &&
+    sameKind &&
+    existing.accountingCallKey === replacement.accountingCallKey
+  ) {
+    return true;
+  }
+
+  const existingHasStableIdentity =
+    existing.accountingCallKey !== undefined || existing.accountingScopeKey !== undefined;
+  const replacementHasStableIdentity =
+    replacement.accountingCallKey !== undefined || replacement.accountingScopeKey !== undefined;
+  if (existingHasStableIdentity && replacementHasStableIdentity) return false;
+  return replacement.key
+    ? existing.key === replacement.key
+    : existing.key === undefined && existing.index === replacement.index;
+}
+
+function createResumeJournal(entries: JournalEntry[]): Map<string | number, JournalEntry> {
+  const journal = new Map<string | number, JournalEntry>();
+  entries.forEach((entry, index) => {
+    const physicalKey = entry.key ?? entry.index;
+    const key = journal.has(physicalKey) ? `journal-history:${index}:${String(physicalKey)}` : physicalKey;
+    journal.set(key, entry);
+  });
+  return journal;
 }

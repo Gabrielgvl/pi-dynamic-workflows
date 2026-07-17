@@ -407,15 +407,15 @@ export function renderPanelDetailed(
     const done = agents.filter((a) => a.status === "done").length;
     const icon = r.status === "paused" ? "⏸" : "◆";
     const usage = snap?.tokenUsage ?? r.tokenUsage;
-    // The run-level tokenUsage aggregate is only finalized when the run ends, so
-    // it reads 0 for the whole live run; per-agent figures update on each agent
-    // completion, so aggregate those instead. The rate samples the same
-    // fresh+cacheRead sum the header displays, so tok/s tracks the visible
-    // figures. Tokens land at agent-completion granularity, so the rate reflects
-    // completion throughput — it decays to 0 during a single long-running agent
-    // or a stall (which is the intended signal). Paused runs don't accrue
-    // tokens, so their rate is suppressed (a stalled rate would mislead).
-    const runUsage = aggregateAgentUsage(agents);
+    // Runtime checkpoints update aggregate usage while attempts are active. For
+    // legacy runs, per-agent rows can be fresher, so reconcile both sources and
+    // display/sample the larger honest total without double-counting.
+    const checkpointUsage = tokenFigures(usage);
+    const agentUsage = aggregateAgentUsage(agents);
+    const runUsage =
+      checkpointUsage.fresh + checkpointUsage.cacheRead >= agentUsage.fresh + agentUsage.cacheRead
+        ? checkpointUsage
+        : agentUsage;
     sampleTokens(r.runId, runUsage.fresh + runUsage.cacheRead, now);
     const rate = r.status === "running" ? tokensPerSecond(r.runId) : 0;
     const meta = [

@@ -355,7 +355,7 @@ test(
     assert.equal(manager.pause(runId), true);
     assert.equal(manager.getRun(runId)?.status, "paused");
 
-    // Resume must wait for the paused generation to settle before acquiring its lease.
+    // Resume waits until the paused generation safely settles and releases its lease.
     const resumePromise = manager.resume(runId);
     pending.shift()?.("paused-generation-done");
     await origPromise.catch(() => {});
@@ -493,23 +493,21 @@ test(
     const { runId, promise } = manager.startInBackground(oneAgentScript);
     await new Promise((r) => setTimeout(r, 20));
 
-    // Stop first, then delete
     manager.stop(runId);
+    da.resolve("done");
+    await promise.catch(() => {});
     const deleted = manager.deleteRun(runId);
     assert.equal(deleted, true);
 
     const run = manager.getRun(runId);
     assert.equal(run, undefined, "deleted run should not be accessible");
-
-    da.resolve("done");
-    await promise.catch(() => {});
   }),
 );
 
 // ─── deleteRun tests (2 tests) ─────────────────────────────────────────────────
 
 test(
-  "deleteRun can delete a running run (removes from memory and persistence)",
+  "deleteRun refuses a running run until its attempt settles",
   withTempCwd(async (cwd) => {
     const da = deferredAgent();
     const manager = new WorkflowManager({ cwd, agent: da.runner });
@@ -517,22 +515,18 @@ test(
     const { runId, promise } = manager.startInBackground(oneAgentScript);
     await new Promise((r) => setTimeout(r, 20));
 
-    // Delete while running — should succeed (removes from tracking)
+    assert.equal(manager.deleteRun(runId), false, "active execution ownership prevents cleanup");
+    da.resolve("done");
+    await promise;
     const deleted = manager.deleteRun(runId);
     assert.equal(deleted, true);
-
-    // Should not be in memory
     assert.equal(manager.getRun(runId), undefined);
 
-    // Should not be in persistence
     const runs = manager.listRuns();
     assert.equal(
       runs.find((r) => r.runId === runId),
       undefined,
     );
-
-    da.resolve("done");
-    await promise.catch(() => {});
   }),
 );
 
@@ -540,9 +534,8 @@ test(
   "deleteRun deletes persisted journal entries",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
-    const { runId } = manager.startInBackground(oneAgentScript);
-    // Wait for completion
-    await new Promise((r) => setTimeout(r, 30));
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await promise;
 
     const deleted = manager.deleteRun(runId);
     assert.equal(deleted, true);

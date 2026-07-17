@@ -23,6 +23,10 @@ export interface WorkflowAgentSnapshot {
   tokenUsage?: AgentUsage;
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
+  /** Current physical journal key, when known. */
+  key?: string;
+  /** Stable logical identity used to retain the row across keyed resume/reorder. */
+  accountingCallKey?: string;
 }
 
 export interface WorkflowSnapshot {

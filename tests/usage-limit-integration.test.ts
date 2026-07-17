@@ -18,6 +18,7 @@ import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { WorkflowAgent } from "../src/agent.js";
 import { WorkflowErrorCode } from "../src/errors.js";
+import { runWorkflow } from "../src/workflow.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
@@ -55,6 +56,7 @@ async function withFauxSession(
     setResponses: (msgs: unknown[]) => void;
     fauxAssistantMessage: typeof import("@earendil-works/pi-ai").fauxAssistantMessage;
   }) => Promise<void>,
+  options: { tokensPerSecond?: number } = {},
 ): Promise<void> {
   const { registerFauxProvider, fauxAssistantMessage } = await loadFaux();
   const home = mkdtempSync(join(tmpdir(), "pi-dw-i26-home-"));
@@ -64,6 +66,7 @@ async function withFauxSession(
   const faux = registerFauxProvider({
     provider: "deepseek",
     models: [{ id: "faux-deepseek", name: "Faux DeepSeek", contextWindow: 128000, maxTokens: 4096 }],
+    tokensPerSecond: options.tokensPerSecond,
   });
   try {
     await withFakeHomeAsync(home, () =>
@@ -106,6 +109,97 @@ test("a successful real turn whose text merely mentions 'rate limit' is NOT misc
     const agent = new WorkflowAgent({ cwd, session: { model: model as never } });
     const text = await agent.run("do the task", { label: "ok" });
     assert.ok(typeof text === "string" && text.includes("Done."), `expected normal text, got ${String(text)}`);
+  }));
+
+test("real createAgentSession emits live usage and a delayed final sample", () =>
+  withFauxSession(async ({ cwd, model, setResponses, fauxAssistantMessage }) => {
+    setResponses([fauxAssistantMessage("streamed usage ".repeat(20), { stopReason: "stop" })]);
+    const agent = new WorkflowAgent({ cwd, session: { model: model as never } });
+    const events: string[] = [];
+    const updates: number[] = [];
+    let finalTotal = 0;
+
+    const result = await agent.run("measure this turn", {
+      label: "usage-probe",
+      onUsageUpdate: (usage) => {
+        events.push("update");
+        updates.push(usage.total);
+      },
+      onUsage: (usage) => {
+        events.push("final");
+        finalTotal = usage.total;
+      },
+    });
+
+    assert.match(result, /streamed usage/);
+    assert.ok(updates.length > 0, "session.subscribe drives live usage callbacks");
+    assert.ok(finalTotal > 0, "final session stats are reported before disposal");
+    assert.equal(events.at(-1), "final", "the final usage callback follows incremental session events");
+  }));
+
+test("real createAgentSession timeout aborts and settles before workflow completion", () =>
+  withFauxSession(
+    async ({ cwd, model, setResponses, fauxAssistantMessage }) => {
+      setResponses([fauxAssistantMessage("slow response ".repeat(50), { stopReason: "stop" })]);
+      const result = await runWorkflow(
+        `export const meta = { name: 'real_timeout', description: 'real timeout' }
+return await agent('slow provider', { label: 'slow', timeoutMs: 5 })`,
+        {
+          agent: new WorkflowAgent({ cwd, session: { model: model as never } }),
+          persistLogs: false,
+        },
+      );
+      const attempt = result.runtimeCheckpoint.attempts["root/call:0"]?.[0];
+      assert.equal(result.result, null);
+      assert.equal(attempt?.status, "timed_out");
+      assert.ok((attempt?.usage.total ?? 0) > 0, "the settled timeout retains final or estimated usage");
+    },
+    { tokensPerSecond: 1 },
+  ));
+
+test("real createAgentSession retry ignores delayed final telemetry from the prior attempt", () =>
+  withFauxSession(async ({ cwd, model, setResponses, fauxAssistantMessage }) => {
+    setResponses([
+      fauxAssistantMessage(" ".repeat(1000), { stopReason: "stop" }),
+      fauxAssistantMessage("retry succeeded", { stopReason: "stop" }),
+    ]);
+    const realAgent = new WorkflowAgent({ cwd, session: { model: model as never } });
+    let calls = 0;
+    let delayedFirst: import("../src/agent.js").AgentUsage | undefined;
+    let delayedFirstCallback: ((usage: import("../src/agent.js").AgentUsage) => void) | undefined;
+    let secondFinal: import("../src/agent.js").AgentUsage | undefined;
+    const result = await runWorkflow(
+      `export const meta = { name: 'real_retry', description: 'real retry telemetry' }
+return await agent('retry through a real session', { label: 'retry', retries: 1 })`,
+      {
+        persistLogs: false,
+        agent: {
+          async run(prompt, options) {
+            calls++;
+            if (calls === 2 && delayedFirst) delayedFirstCallback?.(delayedFirst);
+            if (calls === 1) delayedFirstCallback = options.onUsage;
+            return realAgent.run(prompt, {
+              ...options,
+              onUsageUpdate: calls === 1 ? undefined : options.onUsageUpdate,
+              onUsage: (usage) => {
+                if (calls === 1) delayedFirst = usage;
+                else {
+                  secondFinal = usage;
+                  options.onUsage?.(usage);
+                }
+              },
+            });
+          },
+        },
+      },
+    );
+
+    const attempts = result.runtimeCheckpoint.attempts["root/call:0"] ?? [];
+    assert.equal(calls, 2);
+    assert.equal(result.result, "retry succeeded");
+    assert.ok(delayedFirst && secondFinal);
+    assert.ok(delayedFirst.total > secondFinal.total, "fixture makes stale telemetry detectably larger");
+    assert.equal(attempts[1]?.usage.total, secondFinal.total, "attempt 2 is isolated from attempt 1 callbacks");
   }));
 
 test("through the manager: a usage limit pauses the run (not fails) and resume replays the journal", () =>

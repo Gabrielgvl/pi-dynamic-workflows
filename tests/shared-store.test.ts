@@ -67,6 +67,40 @@ test("SharedStore.applyDelta: replaying parallel-agent deltas in callSeq order i
   assert.equal(store.get("y"), 2, "agent 3 write must be present");
 });
 
+test("sequenced replay advances the live clock so later writes win", () => {
+  const original = new SharedStore();
+  for (let index = 0; index < 4; index++) original.put(`padding-${index}`, index);
+  original.trackPut("winner", "replayed", "agent", "child-scope");
+  const journaled = original.commitSequencedDelta("agent");
+  assert.equal(journaled.sequences.winner, 5);
+
+  const resumed = new SharedStore();
+  resumed.applyDelta(journaled.values, "child-scope", journaled.sequences);
+  resumed.trackPut("winner", "live", "live-agent", "child-scope");
+
+  assert.equal(resumed.get("winner"), "live");
+  const live = resumed.commitSequencedDelta("live-agent");
+  assert.ok(live.sequences.winner > journaled.sequences.winner);
+  assert.deepEqual(resumed.commitSequencedScopeDeltas("child-scope").values, { winner: "live" });
+});
+
+test("wrapper delta rebase preserves internal order and advances before later live writes", () => {
+  const store = new SharedStore();
+  store.put("winner", "before-wrapper");
+
+  const rebased = store.applyRebasedDelta(
+    { first: "one", winner: "wrapper", last: "three" },
+    { first: 20, winner: 30, last: 40 },
+  );
+  assert.equal(store.get("winner"), "wrapper");
+  assert.ok(rebased.sequences.first < rebased.sequences.winner);
+  assert.ok(rebased.sequences.winner < rebased.sequences.last);
+
+  store.trackPut("winner", "live", "live-agent");
+  assert.equal(store.get("winner"), "live");
+  assert.ok(store.commitSequencedDelta("live-agent").sequences.winner > rebased.sequences.last);
+});
+
 test("SharedStore.dispose clears map and agent deltas", () => {
   const store = new SharedStore();
   store.put("k", "v");

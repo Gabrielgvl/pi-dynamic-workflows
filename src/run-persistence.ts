@@ -8,6 +8,8 @@ import type { AgentUsage } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import { MAX_AGENTS_PER_RUN } from "./config.js";
 import type { WorkflowErrorCode } from "./errors.js";
+import type { RuntimeCheckpoint, TokenUsage } from "./usage.js";
+import type { JournalEntry } from "./workflow.js";
 import { canonicalWorkflowCwd, workflowProjectKey, workflowProjectPaths } from "./workflow-paths.js";
 
 export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
@@ -59,23 +61,32 @@ export interface PersistedAgentState {
   prompt: string;
   status: "queued" | "running" | "done" | "error" | "skipped";
   result?: unknown;
+  resultPreview?: string;
   error?: string;
   errorCode?: WorkflowErrorCode;
   recoverable?: boolean;
   history?: AgentHistoryEntry[];
   startedAt?: string;
   endedAt?: string;
-  /** Tokens used by this agent (a scalar estimate when the provider reports no usage). */
+  /** Tokens used by this logical agent across all attempts. */
   tokens?: number;
   /** Per-agent token usage breakdown, when the provider reported one. */
   tokenUsage?: AgentUsage;
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
+  /** Current physical journal key, when known. */
+  key?: string;
+  /** Stable logical identity used to retain the row across keyed resume/reorder. */
+  accountingCallKey?: string;
 }
 
+export type ResolvedExecutionOptions = PersistedExecutionOptions;
+
 export interface PersistedRunState {
-  /** Version 2 is the projected/validated format; absent means legacy v1 input. */
+  /** Version 2 is the projected/validated cwd-aware format; absent means legacy input. */
   version?: 2;
+  /** Compatibility marker used by the durable runtime-accounting branch. */
+  schemaVersion?: 2;
   runId: string;
   /** Canonical execution cwd. Missing in legacy files and filled from the selected namespace on read. */
   cwd?: string;
@@ -107,27 +118,27 @@ export interface PersistedRunState {
   updatedAt: string;
   completedAt?: string;
   durationMs?: number;
-  tokenUsage?: {
-    input: number;
-    output: number;
-    total: number;
-    cost?: number;
-    cacheRead?: number;
-    cacheWrite?: number;
-  };
-  /** Cached agent results for resume, keyed by deterministic call index. */
-  journal?: Array<{ index: number; hash: string; result: unknown; storeDelta?: Record<string, unknown> }>;
+  tokenUsage?:
+    | TokenUsage
+    | {
+        input: number;
+        output: number;
+        total: number;
+        cost?: number;
+        cacheRead?: number;
+        cacheWrite?: number;
+      };
+  /** Cumulative usage, attempt state, and phase charges for this logical run. */
+  runtimeCheckpoint?: RuntimeCheckpoint;
+  /** Cached results with stable hierarchical keys (numeric-only entries are legacy). */
+  journal?: JournalEntry[];
   /**
    * Opt-out of auto-resume for this run (default true, i.e. eligible unless
    * explicitly set to false via ExecOptions.autoResume). Set once at run start
    * and carried through resumes; see UsageLimitScheduler.
    */
   autoResume?: boolean;
-  /**
-   * Auto-resume attempt counter for the current usage_limit pause-cycle, owned
-   * and persisted by UsageLimitScheduler (best-effort). Absent/0 means no
-   * auto-resume attempt has been recorded yet.
-   */
+  /** Auto-resume attempt counter for the current usage_limit pause-cycle. */
   autoResumeAttempts?: number;
   /** Bounded deterministic terminal evidence. Paused runs never carry this field. */
   terminalSnapshot?: TerminalSnapshot;
@@ -329,13 +340,42 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
     const cost = optionalNumber(usage.cost, `${field}.cost`);
     const cacheRead = optionalNumber(usage.cacheRead, `${field}.cacheRead`);
     const cacheWrite = optionalNumber(usage.cacheWrite, `${field}.cacheWrite`);
-    return {
+    const base = {
       input: number(usage.input, `${field}.input`),
       output: number(usage.output, `${field}.output`),
       total: number(usage.total, `${field}.total`),
       ...(cost === undefined ? {} : { cost }),
       ...(cacheRead === undefined ? {} : { cacheRead }),
       ...(cacheWrite === undefined ? {} : { cacheWrite }),
+    };
+    if (usage.schemaVersion === undefined && usage.accounting === undefined) return base;
+    if (usage.schemaVersion !== 1) throw new Error(`Invalid ${field}.schemaVersion`);
+    const accounting = record(usage.accounting, `${field}.accounting`);
+    const reasoning = record(accounting.reasoning, `${field}.accounting.reasoning`);
+    const providerCache = record(accounting.providerCache, `${field}.accounting.providerCache`);
+    if (reasoning.includedInOutput !== true) throw new Error(`Invalid ${field}.accounting.reasoning.includedInOutput`);
+    return {
+      input: base.input,
+      output: base.output,
+      total: base.total,
+      cost: cost ?? 0,
+      cacheRead: cacheRead ?? 0,
+      cacheWrite: cacheWrite ?? 0,
+      schemaVersion: 1,
+      accounting: {
+        measured: number(accounting.measured, `${field}.accounting.measured`),
+        estimated: number(accounting.estimated, `${field}.accounting.estimated`),
+        legacyUnclassified: number(accounting.legacyUnclassified, `${field}.accounting.legacyUnclassified`),
+        journalReplay: number(accounting.journalReplay, `${field}.accounting.journalReplay`),
+        reasoning: {
+          tokens: number(reasoning.tokens, `${field}.accounting.reasoning.tokens`),
+          includedInOutput: true,
+        },
+        providerCache: {
+          read: number(providerCache.read, `${field}.accounting.providerCache.read`),
+          write: number(providerCache.write, `${field}.accounting.providerCache.write`),
+        },
+      },
     };
   };
   const agentUsage = (value: unknown, field: string): AgentUsage | undefined => {
@@ -350,8 +390,8 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
       cacheWrite: number(usage.cacheWrite, `${field}.cacheWrite`),
     };
   };
-  const normalizeExecutionOptions = (value: unknown, legacy: boolean): PersistedExecutionOptions => {
-    if (value === undefined && legacy) return { ...LEGACY_EXECUTION_OPTIONS };
+  const normalizeExecutionOptions = (value: unknown, _legacy: boolean): PersistedExecutionOptions => {
+    if (value === undefined) return { ...LEGACY_EXECUTION_OPTIONS };
     const options = record(value, "executionOptions");
     const intInRange = (key: string, min: number, max: number): number => {
       const parsed = number(options[key], `executionOptions.${key}`, true);
@@ -410,6 +450,7 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
         prompt: string(agent.prompt, `agents[${index}].prompt`, 1_000_000),
         status: agent.status as PersistedAgentState["status"],
         result: agent.result,
+        resultPreview: optionalString(agent.resultPreview, `agents[${index}].resultPreview`, 20_000),
         error: optionalString(agent.error, `agents[${index}].error`, 20_000),
         errorCode: optionalString(agent.errorCode, `agents[${index}].errorCode`, 128) as WorkflowErrorCode | undefined,
         recoverable:
@@ -424,23 +465,88 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
         tokens: optionalNumber(agent.tokens, `agents[${index}].tokens`),
         tokenUsage: agentUsage(agent.tokenUsage, `agents[${index}].tokenUsage`),
         model: optionalString(agent.model, `agents[${index}].model`, 512),
+        key: optionalString(agent.key, `agents[${index}].key`, 2048),
+        accountingCallKey: optionalString(agent.accountingCallKey, `agents[${index}].accountingCallKey`, 2048),
       };
     });
   };
   const normalizeJournal = (value: unknown, legacy: boolean): PersistedRunState["journal"] => {
     if (value === undefined) return legacy ? [] : undefined;
-    if (!Array.isArray(value) || value.length > MAX_AGENTS_PER_RUN) throw new Error("Invalid journal");
+    if (!Array.isArray(value) || value.length > MAX_AGENTS_PER_RUN * 4) throw new Error("Invalid journal");
     return value.map((item, index) => {
       const entry = record(item, `journal[${index}]`);
+      const prefix = `journal[${index}]`;
+      const kind = entry.kind;
+      if (kind !== undefined && kind !== "agent" && kind !== "checkpoint" && kind !== "workflow") {
+        throw new Error(`Invalid ${prefix}.kind`);
+      }
       const storeDelta =
-        entry.storeDelta === undefined ? undefined : { ...record(entry.storeDelta, `journal[${index}].storeDelta`) };
+        entry.storeDelta === undefined ? undefined : { ...record(entry.storeDelta, `${prefix}.storeDelta`) };
+      const rawSequences =
+        entry.storeDeltaSequences === undefined
+          ? undefined
+          : record(entry.storeDeltaSequences, `${prefix}.storeDeltaSequences`);
+      const storeDeltaSequences = rawSequences
+        ? Object.fromEntries(
+            Object.entries(rawSequences).map(([key, sequence]) => [
+              key,
+              number(sequence, `${prefix}.storeDeltaSequences.${key}`, true),
+            ]),
+          )
+        : undefined;
+      const descendants =
+        entry.descendantAgentAccountingCallKeys === undefined
+          ? undefined
+          : stringArray(
+              entry.descendantAgentAccountingCallKeys,
+              `${prefix}.descendantAgentAccountingCallKeys`,
+              false,
+              MAX_AGENTS_PER_RUN,
+            );
+      const key = optionalString(entry.key, `${prefix}.key`, 2048);
+      const usage = tokenUsage(entry.usage, `${prefix}.usage`) as TokenUsage | undefined;
+      const tokens = optionalNumber(entry.tokens, `${prefix}.tokens`);
+      const agentCount = optionalNumber(entry.agentCount, `${prefix}.agentCount`, true);
+      const accountingScopeKey = optionalString(entry.accountingScopeKey, `${prefix}.accountingScopeKey`, 2048);
+      const accountingCallKey = optionalString(entry.accountingCallKey, `${prefix}.accountingCallKey`, 2048);
       return {
-        index: number(entry.index, `journal[${index}].index`, true),
-        hash: string(entry.hash, `journal[${index}].hash`, 512),
+        index: number(entry.index, `${prefix}.index`, true),
+        hash: string(entry.hash, `${prefix}.hash`, 512),
         result: entry.result,
+        ...(key === undefined ? {} : { key }),
+        ...(kind === undefined ? {} : { kind: kind as JournalEntry["kind"] }),
+        ...(usage === undefined ? {} : { usage }),
+        ...(tokens === undefined ? {} : { tokens }),
+        ...(agentCount === undefined ? {} : { agentCount }),
+        ...(descendants === undefined ? {} : { descendantAgentAccountingCallKeys: descendants }),
+        ...(accountingScopeKey === undefined ? {} : { accountingScopeKey }),
+        ...(accountingCallKey === undefined ? {} : { accountingCallKey }),
         ...(storeDelta === undefined ? {} : { storeDelta }),
+        ...(storeDeltaSequences === undefined ? {} : { storeDeltaSequences }),
       };
     });
+  };
+  const normalizeRuntimeCheckpoint = (value: unknown): RuntimeCheckpoint | undefined => {
+    if (value === undefined) return undefined;
+    const checkpoint = record(value, "runtimeCheckpoint");
+    if (checkpoint.schemaVersion !== 1 && checkpoint.schemaVersion !== 2) {
+      throw new Error("Invalid runtimeCheckpoint.schemaVersion");
+    }
+    const usage = tokenUsage(checkpoint.usage, "runtimeCheckpoint.usage");
+    if (!usage || !("schemaVersion" in usage)) throw new Error("Invalid runtimeCheckpoint.usage");
+    const phaseBudgets = record(checkpoint.phaseBudgets, "runtimeCheckpoint.phaseBudgets");
+    const attempts = record(checkpoint.attempts, "runtimeCheckpoint.attempts");
+    const scopeUsage =
+      checkpoint.scopeUsage === undefined ? undefined : record(checkpoint.scopeUsage, "runtimeCheckpoint.scopeUsage");
+    return {
+      schemaVersion: checkpoint.schemaVersion,
+      usage: usage as TokenUsage,
+      phaseBudgets: structuredClone(phaseBudgets) as RuntimeCheckpoint["phaseBudgets"],
+      attempts: structuredClone(attempts) as RuntimeCheckpoint["attempts"],
+      ...(scopeUsage === undefined
+        ? {}
+        : { scopeUsage: structuredClone(scopeUsage) as RuntimeCheckpoint["scopeUsage"] }),
+    };
   };
   const normalizeTerminalSnapshot = (value: unknown): TerminalSnapshot | undefined => {
     if (value === undefined) return undefined;
@@ -482,7 +588,10 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
   const normalizeState = (input: unknown, expectedRunId?: string): PersistedRunState => {
     const state = record(input, "persisted workflow record");
     if (state.version !== undefined && state.version !== 2) throw new Error("Unsupported persisted workflow version");
-    const legacy = state.version === undefined;
+    if (state.schemaVersion !== undefined && state.schemaVersion !== 2) {
+      throw new Error("Unsupported persisted workflow schemaVersion");
+    }
+    const legacy = state.version === undefined && state.schemaVersion === undefined;
     if (!isSafeRunId(state.runId as string) || (expectedRunId !== undefined && state.runId !== expectedRunId)) {
       throw new Error("Persisted workflow runId mismatch");
     }
@@ -498,6 +607,7 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
     if (currentPhase !== undefined && !phases.includes(currentPhase)) throw new Error("Invalid currentPhase");
     const normalized: PersistedRunState = {
       version: 2,
+      schemaVersion: 2,
       runId: state.runId as string,
       cwd: canonicalCwd,
       projectKey,
@@ -523,6 +633,7 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
       completedAt: optionalString(state.completedAt, "completedAt", 64),
       durationMs: optionalNumber(state.durationMs, "durationMs"),
       tokenUsage: tokenUsage(state.tokenUsage, "tokenUsage"),
+      runtimeCheckpoint: normalizeRuntimeCheckpoint(state.runtimeCheckpoint),
       journal: normalizeJournal(state.journal, legacy),
       autoResume:
         state.autoResume === undefined || typeof state.autoResume === "boolean"
@@ -531,7 +642,10 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
               throw new Error("Invalid autoResume");
             })(),
       autoResumeAttempts: optionalNumber(state.autoResumeAttempts, "autoResumeAttempts", true),
-      terminalSnapshot: normalizeTerminalSnapshot(state.terminalSnapshot),
+      terminalSnapshot:
+        state.status === "completed" || state.status === "failed" || state.status === "aborted"
+          ? normalizeTerminalSnapshot(state.terminalSnapshot)
+          : undefined,
     };
     if (normalized.terminalSnapshot?.runId !== undefined && normalized.terminalSnapshot.runId !== normalized.runId)
       throw new Error("Persisted terminalSnapshot runId mismatch");
@@ -641,8 +755,9 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
       try {
         for (const path of candidateRunPaths(runId)) {
           const dir = path === primaryRunPath(runId) ? runsDir : legacyRunsDir;
-          // Best-effort cleanup of the sidecar files alongside the primary.
-          for (const sidecar of [`${path}.bak`, `${path}.tmp`, lockPath(dir, runId)]) {
+          // Remove data before the lease sidecar so another process cannot
+          // acquire this run while its persisted state is only partly deleted.
+          for (const sidecar of [`${path}.bak`, `${path}.tmp`]) {
             try {
               if (_existsSync(sidecar)) _unlinkSync(sidecar);
             } catch {
@@ -656,6 +771,12 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
             }
           } catch {
             // ignore per-file cleanup failures
+          }
+          try {
+            const lock = lockPath(dir, runId);
+            if (_existsSync(lock)) _unlinkSync(lock);
+          } catch {
+            // ignore lock cleanup failures
           }
         }
         return deleted;

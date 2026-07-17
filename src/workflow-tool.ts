@@ -104,8 +104,7 @@ const workflowToolSchema = Type.Object({
   ),
   agentRetries: Type.Optional(
     Type.Number({
-      description:
-        "Retry attempts for recoverable agent failures such as timeout, connection failure, or empty assistant output. Default 0 unless configured.",
+      description: "Retry attempts for recoverable failures; timeouts settle before retry. Default 0.",
     }),
   ),
   agentTimeoutMs: Type.Optional(
@@ -117,7 +116,7 @@ const workflowToolSchema = Type.Object({
   tokenBudget: Type.Optional(
     Type.Number({
       description:
-        "Hard total-token budget for the whole run. Once spent reaches it, further agent() calls fail and the run stops. Omit for no limit. Set it when the user asks to cap spend.",
+        "Best-effort token ceiling, cumulative across resume; live or delayed usage may overshoot. Omit for no limit.",
     }),
   ),
   resumeFromRunId: Type.Optional(
@@ -206,11 +205,11 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         "For workflow, always pass one raw JavaScript string in the required script parameter; do not include Markdown fences or prose around the script.",
         "For workflow, the script's first statement must be `export const meta = { name: 'short_snake_case', description: 'non-empty human description', phases: [{ title: 'Phase name' }] }`; meta.name and meta.description are required non-empty strings.",
         "For workflow, write plain JavaScript after the meta export. Do not use TypeScript syntax, imports, require(), fs, Date.now(), Math.random(), or new Date().",
-        "For workflow, available globals are agent(prompt, opts), parallel(thunks), pipeline(items, ...stages), phase(title), log(message), args, cwd, process.cwd(), and budget. Every workflow must call agent() at least once; do not use workflow only to declare phases or return a static object.",
+        "For workflow, available globals are agent(prompt, opts), parallel(thunks), pipeline(items, ...stages), workflow(nameOrScript, args?, { key?: string }), phase(title), log(message), args, cwd, process.cwd(), and budget. Every workflow must call agent() at least once; do not use workflow only to declare phases or return a static object.",
         "For workflow, prefer the built-in quality helpers when they fit (each is built on agent()/parallel() and returns plain data): verify(item, {reviewers, threshold, lens}) for adversarial fact-checking; judgePanel(attempts, {judges, rubric}) to score N candidates and return the best; loopUntilDry({round, key, consecutiveEmpty}) to keep finding until rounds stop yielding new items; completenessCheck(args, results) as a final 'what's missing' critic.",
         "For workflow, when meta.phases declares more than one phase, call phase('Exact Title') at the start of each phase's work (or set opts.phase on each agent) so every agent groups under the correct phase; never declare a phase you don't switch into — a declared phase with no agents shows as 0/0 and any agent you forgot to move stays in the previous phase.",
         "For workflow, do not set tokenBudget or agentTimeoutMs unless the user explicitly asks to cap spend or time; the defaults are unbounded.",
-        "For workflow, to bound spend: pass tokenBudget for a hard run-wide cap; carve a per-phase ceiling with phase('Name', {budget: N}) (that phase throws at its sub-budget without touching the run total — wrap its work in try/catch so later phases proceed); use retry(thunk, {attempts, until}) for bounded retry, and gate(thunk, validator, {attempts}) when a validator's feedback should steer the next attempt. To degrade gracefully, branch on budget.remaining() to skip optional rounds or choose a lighter tier.",
+        "For workflow, tokenBudget and phase budgets are durable best-effort ceilings: admission is rechecked, caught threshold errors stay terminal, and delayed telemetry may overshoot. Use budget.remaining() to degrade before crossing; retry() and gate() provide bounded recovery.",
         "For workflow, prefer it for decomposable work: repository inspection, independent research/checks, multi-perspective review, or fan-out/fan-in synthesis. Do not use it for a single quick file read/edit or when ordinary tools are enough.",
         "For workflow, parallel() takes functions, not promises: use `await parallel(items.map(item => () => agent('...', { label: '...' })))`, never `await parallel(items.map(item => agent(...)))`. Results are returned in input order.",
         "For workflow, pipeline(items, ...stages) runs each item through stages sequentially, while different items may run concurrently. Each stage receives (previousValue, originalItem, index).",
@@ -225,7 +224,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         agentTypeGuideline(),
         "For workflow, do not assume the parent assistant has repository code context inside subagents; include enough task context and relevant paths in each agent prompt.",
         "For workflow, runs are background by default: the tool returns immediately with a run ID, the turn ends so the user isn't blocked, and the result is delivered back into the conversation when the run finishes. Pass background: false only when you must use the result inline in this same turn (it will block).",
-        "For workflow, you may call `await workflow('saved-name', argsObject)` to run a saved workflow inline and use its result; nesting is one level deep only, and the global 16-concurrent / 1000-total caps hold across the nesting.",
+        "For workflow, workflow(name, args, { key }) nests one level and shares global caps. Identical siblings need unique non-empty keys for stable accounting; duplicate explicit or implicit identities fail.",
       ].filter((g): g is string => typeof g === "string" && g.length > 0);
     },
     parameters: workflowToolSchema,
@@ -385,10 +384,14 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       snapshot = recomputeWorkflowSnapshot(snapshot);
       display.complete(snapshot);
 
-      // Format token usage (include cost when the provider reports it)
+      // Format measured/estimated usage with fresh/cache reconciliation and
+      // disclose any honest best-effort budget overshoot.
       const tokenSegment = fmtTokenSegment(tokenFigures(result.tokenUsage), fmtFull);
+      const budgetInfo = result.budget?.overshoot
+        ? ` — best-effort ceiling ${result.budget.limit.toLocaleString()}, overshoot ${result.budget.overshoot.toLocaleString()}`
+        : "";
       const tokenInfo = tokenSegment
-        ? `\n\nToken usage: ${tokenSegment}${result.tokenUsage?.cost ? ` (${fmtCost(result.tokenUsage.cost)})` : ""}`
+        ? `\n\nToken usage: ${tokenSegment}${result.tokenUsage?.cost ? ` (${fmtCost(result.tokenUsage.cost)})` : ""}${budgetInfo}`
         : "";
 
       const formattedResult =

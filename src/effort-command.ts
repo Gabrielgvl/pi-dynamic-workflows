@@ -1,12 +1,13 @@
 /**
  * Standing `/effort` opt-in (pi's answer to CC's ultracode): a session toggle that
  * auto-arms a workflow for substantive interactive messages, with effort-tier
- * guidance nudging fan-out breadth and the hard caps (tokenBudget / maxAgents) the
+ * guidance nudging fan-out breadth and the runtime ceilings (tokenBudget / maxAgents) the
  * model should set on the workflow tool call.
  *
  * Honest scope: the runtime cannot enforce "reviewer N / loop K" — those live in
  * the script the model writes — so the tiers are guidance plus the model setting
- * the real hard caps (tokenBudget/maxAgents are genuine runtime ceilings). The
+ * the runtime gates (maxAgents is strict; tokenBudget is a durable best-effort
+ * ceiling because delayed provider telemetry can overshoot). The
  * pre-flight ceiling-confirm dialog (roadmap P1-5 #4) is a downscope point: an
  * `input` hook transforms synchronously and can't await a confirm, so it is left
  * to a follow-up; `/effort` is explicit opt-in, which is the safety valve.

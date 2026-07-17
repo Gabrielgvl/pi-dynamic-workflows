@@ -8,50 +8,60 @@
  *
  * Journal integration: callers capture `store.commitDelta(deltaKey)` alongside
  * each agent result in the journal. On resume, `store.applyDelta(delta)` rebuilds
- * the store state additively in callSeq order, so parallel-agent writes are
- * replayed correctly without the last-complete-wins ordering bug that a
- * whole-Map restore() would cause.
+ * the store additively; internal sequence metadata preserves actual parallel
+ * write order without changing the historical plain-object delta shape.
  *
- * `deltaKey` must be unique across every run that shares this store instance,
- * not just within one run's callSeq. A nested `workflow()` call restarts its own
- * callSeq at 0 while inheriting the parent's store (so parent and nested-run
- * agents can share state), so a bare callIndex would collide between a parent
- * agent and a concurrently-running nested-run agent that both got index 0 —
- * whichever commits its delta last would clobber the other's entry in
- * `agentDeltas`. Callers compose `deltaKey` as `${runId}:${callIndex}`, and
- * since every run (including each nested run) gets its own distinct `runId`,
- * the composite key is unique across the whole store's lifetime.
+ * `deltaKey` must be unique across every concurrently active journal scope, not
+ * just within one run's callSeq. A nested `workflow()` restarts callSeq at 0
+ * while inheriting the parent's store, so callers use the full hierarchical
+ * journal call key. Scope tracking separately records the latest sequenced write
+ * per key so a nested wrapper reflects final live write order, including failed
+ * attempts and replayed child deltas.
  */
 
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
+interface SequencedWrite {
+  value: unknown;
+  sequence: number;
+}
+
+export interface SequencedStoreDelta {
+  values: Record<string, unknown>;
+  /** Internal journal metadata; `values` retains the historical public shape. */
+  sequences: Record<string, number>;
+}
+
 export class SharedStore {
   private readonly map = new Map<string, unknown>();
-  // Per-agent write deltas for delta-journaling; keyed by a run-unique
-  // `${runId}:${callIndex}` string (see class doc) so nested workflow() runs
-  // sharing this store can't collide on a bare callIndex.
-  private readonly agentDeltas = new Map<string, Record<string, unknown>>();
+  private readonly mapSequences = new Map<string, number>();
+  // Sequence is internal: public journal deltas retain the historical plain-object shape.
+  private writeSequence = 0;
+  private readonly agentDeltas = new Map<string, Map<string, SequencedWrite>>();
+  private readonly scopeWrites = new Map<string, Map<string, SequencedWrite>>();
 
   /** Store a value under `key`. Overwrites any existing value. */
   put(key: string, value: unknown): void {
-    this.map.set(key, value);
+    const write = { value, sequence: ++this.writeSequence };
+    this.applyWrite(key, write);
   }
 
   /**
-   * Store a value and record the write in the per-agent delta for `deltaKey`
-   * (a run-unique `${runId}:${callIndex}` string — see class doc). Used by
-   * per-agent tools created via `createAgentStoreTools` so that each agent's
-   * writes can be journaled and replayed independently.
+   * Store a value and record the write in the per-agent delta for the full
+   * hierarchical `deltaKey`. When `scopeKey` is supplied, also retain the latest
+   * sequenced write for the enclosing nested wrapper.
    */
-  trackPut(key: string, value: unknown, deltaKey: string): void {
-    this.map.set(key, value);
+  trackPut(key: string, value: unknown, deltaKey: string, scopeKey?: string): void {
+    const write = { value, sequence: ++this.writeSequence };
+    this.applyWrite(key, write);
     let delta = this.agentDeltas.get(deltaKey);
     if (!delta) {
-      delta = {};
+      delta = new Map<string, SequencedWrite>();
       this.agentDeltas.set(deltaKey, delta);
     }
-    delta[key] = value;
+    delta.set(key, write);
+    if (scopeKey) this.recordScopeWrite(scopeKey, key, write);
   }
 
   /** Retrieve the value for `key`, or `undefined` when absent. */
@@ -74,9 +84,34 @@ export class SharedStore {
    * Called after an agent completes to get the set of keys it wrote.
    */
   commitDelta(deltaKey: string): Record<string, unknown> {
-    const delta = this.agentDeltas.get(deltaKey) ?? {};
+    return this.commitSequencedDelta(deltaKey).values;
+  }
+
+  /** Extract a delta together with private ordering metadata for workflow journals. */
+  commitSequencedDelta(deltaKey: string): SequencedStoreDelta {
+    const delta = this.agentDeltas.get(deltaKey);
     this.agentDeltas.delete(deltaKey);
-    return delta;
+    return delta ? sequencedDelta(delta) : { values: {}, sequences: {} };
+  }
+
+  /**
+   * Extract writes left by settled attempts in a nested journal scope. Failed
+   * attempts are not journaled individually, but a caller may catch their error;
+   * their observable store writes therefore belong to the enclosing wrapper.
+   */
+  commitScopeDeltas(scopeKey: string): Record<string, unknown> {
+    return this.commitSequencedScopeDeltas(scopeKey).values;
+  }
+
+  /** Extract a nested scope delta together with its original write ordering. */
+  commitSequencedScopeDeltas(scopeKey: string): SequencedStoreDelta {
+    const writes = this.scopeWrites.get(scopeKey);
+    this.scopeWrites.delete(scopeKey);
+    const deltaPrefix = `${scopeKey}/call:`;
+    for (const deltaKey of this.agentDeltas.keys()) {
+      if (deltaKey.startsWith(deltaPrefix)) this.agentDeltas.delete(deltaKey);
+    }
+    return writes ? sequencedDelta(writes) : { values: {}, sequences: {} };
   }
 
   /**
@@ -84,10 +119,45 @@ export class SharedStore {
    * Used during resume replay so parallel-agent deltas applied in callSeq
    * order accumulate correctly regardless of original completion order.
    */
-  applyDelta(delta: Record<string, unknown>): void {
-    for (const [k, v] of Object.entries(delta)) {
-      this.map.set(k, v);
+  applyDelta(delta: Record<string, unknown>, scopeKey?: string, sequences?: Record<string, number>): void {
+    for (const [key, value] of Object.entries(delta)) {
+      const journalSequence = sequences?.[key];
+      const write = {
+        value,
+        sequence:
+          typeof journalSequence === "number" && Number.isSafeInteger(journalSequence) && journalSequence > 0
+            ? journalSequence
+            : this.writeSequence + 1,
+      };
+      this.writeSequence = Math.max(this.writeSequence, write.sequence);
+      this.applyWrite(key, write);
+      if (scopeKey) this.recordScopeWrite(scopeKey, key, write);
     }
+  }
+
+  /**
+   * Replay one completed wrapper as an atomic current-generation mutation.
+   * Historical sequences determine only the order inside the wrapper; fresh
+   * store sequences make sibling wrapper order follow this generation's replay.
+   */
+  applyRebasedDelta(delta: Record<string, unknown>, sequences?: Record<string, number>): SequencedStoreDelta {
+    const ordered = Object.entries(delta)
+      .map(([key, value], index) => ({ key, value, index, sequence: sequences?.[key] }))
+      .sort((left, right) => {
+        const leftSequence = validSequence(left.sequence);
+        const rightSequence = validSequence(right.sequence);
+        if (leftSequence !== undefined && rightSequence !== undefined) return leftSequence - rightSequence;
+        if (leftSequence !== undefined) return -1;
+        if (rightSequence !== undefined) return 1;
+        return left.index - right.index;
+      });
+    const rebased = new Map<string, SequencedWrite>();
+    for (const { key, value } of ordered) {
+      const write = { value, sequence: ++this.writeSequence };
+      this.applyWrite(key, write);
+      rebased.set(key, write);
+    }
+    return sequencedDelta(rebased);
   }
 
   /**
@@ -96,16 +166,48 @@ export class SharedStore {
    */
   restore(snap: Record<string, unknown>): void {
     this.map.clear();
-    for (const [k, v] of Object.entries(snap)) {
-      this.map.set(k, v);
-    }
+    this.mapSequences.clear();
+    this.writeSequence = 0;
+    for (const [key, value] of Object.entries(snap)) this.put(key, value);
   }
 
   /** Clear all entries (called when the run ends). */
   dispose(): void {
     this.map.clear();
+    this.mapSequences.clear();
     this.agentDeltas.clear();
+    this.scopeWrites.clear();
+    this.writeSequence = 0;
   }
+
+  private applyWrite(key: string, write: SequencedWrite): void {
+    const currentSequence = this.mapSequences.get(key) ?? Number.NEGATIVE_INFINITY;
+    if (write.sequence < currentSequence) return;
+    this.map.set(key, write.value);
+    this.mapSequences.set(key, write.sequence);
+  }
+
+  private recordScopeWrite(scopeKey: string, key: string, write: SequencedWrite): void {
+    let scoped = this.scopeWrites.get(scopeKey);
+    if (!scoped) {
+      scoped = new Map<string, SequencedWrite>();
+      this.scopeWrites.set(scopeKey, scoped);
+    }
+    const current = scoped.get(key);
+    if (!current || write.sequence >= current.sequence) scoped.set(key, write);
+  }
+}
+
+function validSequence(sequence: number | undefined): number | undefined {
+  return typeof sequence === "number" && Number.isSafeInteger(sequence) && sequence > 0 ? sequence : undefined;
+}
+
+function sequencedDelta(writes: Map<string, SequencedWrite>): SequencedStoreDelta {
+  const ordered = [...writes.entries()].sort(([, left], [, right]) => left.sequence - right.sequence);
+  return {
+    values: Object.fromEntries(ordered.map(([key, write]) => [key, write.value])),
+    sequences: Object.fromEntries(ordered.map(([key, write]) => [key, write.sequence])),
+  };
 }
 
 /**
@@ -165,14 +267,13 @@ export function createSharedStoreTools(store: SharedStore): ToolDefinition[] {
 }
 
 /**
- * Create per-agent store tools that attribute writes to `deltaKey`, a
- * run-unique `${runId}:${callIndex}` string (see the `SharedStore` class doc
- * for why the bare callIndex alone is not enough once a nested `workflow()`
- * call shares this store).
+ * Create per-agent store tools that attribute writes to a hierarchical
+ * `deltaKey` and, when supplied, its enclosing journal `scopeKey` (see the
+ * `SharedStore` class doc for why a bare callIndex is insufficient).
  * Used internally by `runWorkflow` so each agent's puts are tracked in the
  * store's delta journal and can be replayed additively on resume.
  */
-export function createAgentStoreTools(store: SharedStore, deltaKey: string): ToolDefinition[] {
+export function createAgentStoreTools(store: SharedStore, deltaKey: string, scopeKey?: string): ToolDefinition[] {
   const storePut = defineTool({
     name: "store_put",
     label: "Store Put",
@@ -184,7 +285,7 @@ export function createAgentStoreTools(store: SharedStore, deltaKey: string): Too
       value: Type.Any({ description: "The value to store (any JSON-serializable value)." }),
     }),
     async execute(_id: string, params: { key: string; value: unknown }) {
-      store.trackPut(params.key, params.value, deltaKey);
+      store.trackPut(params.key, params.value, deltaKey, scopeKey);
       return {
         content: [{ type: "text", text: `Stored value under key "${params.key}".` }],
         details: { key: params.key },

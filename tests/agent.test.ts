@@ -4,7 +4,13 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
-import { listAvailableModelSpecs, resolveAgentModelSpec, usageFromStats, WorkflowAgent } from "../src/agent.js";
+import {
+  listAvailableModelSpecs,
+  readSessionUsage,
+  resolveAgentModelSpec,
+  usageFromStats,
+  WorkflowAgent,
+} from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { resolveModelSpecWithThinking } from "../src/model-spec.js";
 import type { ModelTierConfig } from "../src/model-tier-config.js";
@@ -17,6 +23,20 @@ type WorkflowAgentPrivates = {
   lastAssistantText(messages: unknown[]): string;
   createSessionManager(): { isPersisted(): boolean; getCwd(): string };
 };
+
+test("readSessionUsage includes provider reasoning as an output subset", () => {
+  const usage = readSessionUsage(
+    {
+      tokens: { input: 100, output: 50, cacheRead: 20, cacheWrite: 5, total: 175 },
+      cost: 0.01,
+    },
+    [{ role: "assistant", usage: { reasoning: 12 } }, { role: "assistant", usage: { reasoning: 8 } }, { role: "user" }],
+  );
+
+  assert.equal(usage.reasoning, 20);
+  assert.equal(usage.output, 50, "reasoning is already included in output");
+  assert.equal(usage.total, 175, "reasoning must not be double-counted into total");
+});
 
 // ═══════════════════════════════════════════════════════════════════════
 // persistAgentSessions — in-memory by default, file-backed keyed by project cwd

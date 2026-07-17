@@ -308,6 +308,30 @@ export interface AgentUsage {
   cacheWrite: number;
   total: number;
   cost: number;
+  /** Provider-reported reasoning tokens; already included in output. */
+  reasoning?: number;
+}
+
+export function readSessionUsage(
+  stats: {
+    tokens: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+    cost: number;
+  },
+  messages: unknown[],
+): AgentUsage {
+  const reasoning = messages.reduce<number>((total, value) => {
+    const message = value as Partial<AssistantMessage> | undefined;
+    return total + (message?.role === "assistant" ? (message.usage?.reasoning ?? 0) : 0);
+  }, 0);
+  return {
+    input: stats.tokens.input,
+    output: stats.tokens.output,
+    cacheRead: stats.tokens.cacheRead,
+    cacheWrite: stats.tokens.cacheWrite,
+    total: stats.tokens.total,
+    cost: stats.cost,
+    ...(reasoning > 0 ? { reasoning } : {}),
+  };
 }
 
 /**
@@ -352,6 +376,8 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * (all-zero stats), so consumers keep their scalar fallback.
    */
   onUsage?: (usage: AgentUsage) => void;
+  /** Live cumulative usage updates for best-effort budget cancellation. */
+  onUsageUpdate?: (usage: AgentUsage) => void;
   /**
    * Model spec for this subagent: either `provider/modelId` (unambiguous) or a
    * bare `modelId`. When it can't be resolved, the session default is used and
@@ -583,7 +609,7 @@ export class WorkflowAgent {
     }
 
     let removeAbortListener: (() => void) | undefined;
-    let removeHistoryListener: (() => void) | undefined;
+    let removeSessionListener: (() => void) | undefined;
     let lastHistoryEmit = 0;
     const emitHistory = () => options.onHistory?.(compactAgentHistory(session.messages));
     const maybeEmitHistory = () => {
@@ -600,8 +626,17 @@ export class WorkflowAgent {
         options.signal.addEventListener("abort", onAbort, { once: true });
         removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
       }
-      if (options.onHistory) {
-        removeHistoryListener = session.subscribe(() => maybeEmitHistory());
+      if (options.onHistory || options.onUsageUpdate) {
+        removeSessionListener = session.subscribe(() => {
+          maybeEmitHistory();
+          if (options.onUsageUpdate) {
+            try {
+              options.onUsageUpdate(readSessionUsage(session.getSessionStats(), session.messages));
+            } catch {
+              // Live telemetry is best-effort and must not disturb the session.
+            }
+          }
+        });
       }
 
       await session.prompt(this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)));
@@ -630,7 +665,7 @@ export class WorkflowAgent {
       return text as AgentRunResult<TSchemaDef>;
     } finally {
       removeAbortListener?.();
-      removeHistoryListener?.();
+      removeSessionListener?.();
       try {
         emitHistory();
       } catch {
@@ -639,8 +674,7 @@ export class WorkflowAgent {
       // Read real usage before disposing — dispose tears down the session state.
       if (options.onUsage) {
         try {
-          const usage = usageFromStats(session.getSessionStats());
-          if (usage) options.onUsage(usage);
+          options.onUsage(readSessionUsage(session.getSessionStats(), session.messages));
         } catch {
           // Usage is best-effort; never let stats failure mask the real result/error.
         }

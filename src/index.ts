@@ -103,11 +103,13 @@ export { createWebFetchTool, createWebSearchTool, createWebTools } from "./web-t
 export type {
   AgentOptions,
   JournalEntry,
+  NestedWorkflowOptions,
   SharedRuntime,
   WorkflowMeta,
   WorkflowMetaPhase,
   WorkflowRunOptions,
   WorkflowRunResult,
+  WorkflowTokenUsage,
 } from "./workflow.js";
 export { parseWorkflowScript, runWorkflow } from "./workflow.js";
 export { registerWorkflowCommands } from "./workflow-commands.js";

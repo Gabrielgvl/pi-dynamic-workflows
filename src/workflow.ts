@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import vm from "node:vm";
 import type { Node } from "acorn";
 import { parse } from "acorn";
@@ -18,6 +18,15 @@ import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
 import { createAgentStoreTools, SharedStore } from "./shared-store.js";
+import {
+  type BudgetExhaustion,
+  mergeTokenUsage,
+  type RuntimeCheckpoint,
+  restoreTokenUsage,
+  type TokenUsage,
+  UsageController,
+  type UsageSample,
+} from "./usage.js";
 import { createWorktree, removeWorktree, type Worktree } from "./worktree.js";
 
 export interface WorkflowMetaPhase {
@@ -34,19 +43,37 @@ export interface WorkflowMeta {
   model?: string;
 }
 
-/** One cached agent() result, keyed by its deterministic call index. */
+/** One cached call result, keyed by its stable hierarchical call key. */
 export interface JournalEntry {
+  /** Legacy numeric identity retained for schema-less run compatibility. */
   index: number;
+  /** Stable identity across parent, sibling nested, and child workflow scopes. */
+  key?: string;
+  kind?: "agent" | "checkpoint" | "workflow";
   /** sha256 of the call's identity (prompt + model + phase + agentType + schema). */
   hash: string;
   result: unknown;
+  /** Cumulative usage for all attempts of this logical call. */
+  usage?: TokenUsage;
+  /** Compatibility/display total for all attempts of this logical call. */
+  tokens?: number;
+  /** Logical agents represented by a nested workflow result. */
+  agentCount?: number;
+  /** Exact stable descendant agent identities represented by this completed wrapper generation. */
+  descendantAgentAccountingCallKeys?: string[];
+  /** Stable accounting identity for this call's workflow invocation. */
+  accountingScopeKey?: string;
+  /** Stable logical call identity within accountingScopeKey, independent of wrapper position. */
+  accountingCallKey?: string;
   /**
    * Per-agent write delta (keys set by this agent) for additive replay on resume.
-   * Replaces the former full-map snapshot to fix parallel-agent ordering: applying
-   * deltas in callSeq order accumulates all agents' writes correctly regardless of
-   * which agent finished first. Absent on older journal entries.
+   * Replaces the former full-map snapshot. Internal storeDeltaSequences metadata
+   * preserves actual relative write order when parallel calls replay lexically.
+   * Absent on older journal entries.
    */
   storeDelta?: Record<string, unknown>;
+  /** Internal original write-order metadata; storeDelta retains its public shape. */
+  storeDeltaSequences?: Record<string, number>;
 }
 
 /**
@@ -57,9 +84,32 @@ export interface JournalEntry {
 export interface SharedRuntime {
   limiter: <T>(fn: () => Promise<T>) => Promise<T>;
   agentCount: number;
+  /** @deprecated Use the run result/checkpoint usage total. Retained for compatibility. */
   spent: number;
-  tokenUsage: { input: number; output: number; total: number; cost: number; cacheRead: number; cacheWrite: number };
+  /** @deprecated Use the run result/checkpoint token usage. Retained for compatibility. */
+  tokenUsage: {
+    input: number;
+    output: number;
+    total: number;
+    cost: number;
+    cacheRead: number;
+    cacheWrite: number;
+  };
+  /** @deprecated Nesting is now immutable per invocation. Retained for compatibility. */
   depth: number;
+  /** Internal cumulative usage controller, added lazily for legacy runtimes. */
+  usage?: UsageController;
+  /** Internal ownership registry shared by the top-level run and nested workflows. */
+  liveInvocations?: Set<Promise<unknown>>;
+  /** Internal operations grouped by the invocation that owns their lifetime. */
+  liveOperationsByScope?: Map<string, Set<Promise<unknown>>>;
+}
+
+interface ActiveSharedRuntime extends SharedRuntime {
+  usage: UsageController;
+  tokenUsage: TokenUsage;
+  liveInvocations: Set<Promise<unknown>>;
+  liveOperationsByScope: Map<string, Set<Promise<unknown>>>;
 }
 
 export interface WorkflowRunOptions extends WorkflowAgentOptions {
@@ -91,14 +141,30 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   persistLogs?: boolean;
   /** Run ID for persistence. Auto-generated if not provided. */
   runId?: string;
-  /** Resume: cached agent results keyed by deterministic call index. */
-  resumeJournal?: Map<number, JournalEntry>;
+  /** Resume: cached results keyed by hierarchical key (or legacy numeric index). */
+  resumeJournal?: Map<string | number, JournalEntry>;
+  /** Resume: versioned cumulative accounting and phase-budget state. */
+  runtimeCheckpoint?: RuntimeCheckpoint;
+  /** Called whenever attempt state or cumulative usage changes. */
+  onRuntimeCheckpoint?: (checkpoint: RuntimeCheckpoint) => void;
   /** Resume: the run being resumed (informational; enables resume mode). */
   resumeFromRunId?: string;
   /** Called after each live agent completes so the caller can persist the journal. */
   onAgentJournal?: (entry: JournalEntry) => void;
+  /** Internal: observes entries actually replayed inside a nested invocation. */
+  onJournalReplay?: (entry: JournalEntry) => void;
   /** Internal: shared runtime inherited by a nested workflow() call. */
   sharedRuntime?: SharedRuntime;
+  /** Internal positional scope for hierarchical journal keys. */
+  scopeKey?: string;
+  /** Internal stable scope for usage and phase ownership, independent of execution position. */
+  accountingScopeKey?: string;
+  /** @deprecated Internal compatibility alias for accountingScopeKey. */
+  phaseScopeKey?: string;
+  /** Internal unique invocation scope for descendant operation drain only. */
+  operationScopeKey?: string;
+  /** Internal immutable nesting level (0 = top-level, 1 = child). */
+  nestingDepth?: number;
   /**
    * Shared store for this run. One instance is created per top-level run and
    * propagated into nested workflow() calls. Pass an existing instance to share
@@ -115,7 +181,15 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   confirm?: (promptText: string, options: CheckpointOptions) => Promise<unknown>;
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
-  onAgentStart?: (event: { label: string; phase?: string; prompt: string; model?: string }) => void;
+  onAgentStart?: (event: {
+    label: string;
+    phase?: string;
+    prompt: string;
+    model?: string;
+    key?: string;
+    accountingCallKey?: string;
+    replayed?: boolean;
+  }) => void;
   onAgentEnd?: (event: {
     label: string;
     phase?: string;
@@ -127,16 +201,42 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     error?: string;
     errorCode?: WorkflowErrorCode;
     recoverable?: boolean;
+    key?: string;
+    accountingCallKey?: string;
+    replayed?: boolean;
   }) => void;
-  onAgentHistory?: (event: { label: string; phase?: string; history: AgentHistoryEntry[] }) => void;
-  onTokenUsage?: (usage: {
-    input: number;
-    output: number;
-    total: number;
-    cost: number;
-    cacheRead?: number;
-    cacheWrite?: number;
+  onAgentHistory?: (event: {
+    label: string;
+    phase?: string;
+    history: AgentHistoryEntry[];
+    key?: string;
+    accountingCallKey?: string;
   }) => void;
+  onTokenUsage?: (usage: TokenUsage) => void;
+}
+
+export interface WorkflowTokenUsage {
+  input: number;
+  output: number;
+  total: number;
+  cost: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  schemaVersion?: TokenUsage["schemaVersion"];
+  accounting?: {
+    measured?: number;
+    estimated?: number;
+    legacyUnclassified?: number;
+    journalReplay?: number;
+    reasoning?: {
+      tokens?: number;
+      includedInOutput?: true;
+    };
+    providerCache?: {
+      read?: number;
+      write?: number;
+    };
+  };
 }
 
 export interface WorkflowRunResult<T = unknown> {
@@ -147,14 +247,15 @@ export interface WorkflowRunResult<T = unknown> {
   agentCount: number;
   durationMs: number;
   runId?: string;
-  tokenUsage?: {
-    input: number;
-    output: number;
-    total: number;
-    cost: number;
-    cacheRead?: number;
-    cacheWrite?: number;
-  };
+  /** Backward-compatible public shape; live results include the richer optional accounting fields. */
+  tokenUsage?: WorkflowTokenUsage;
+  runtimeCheckpoint?: RuntimeCheckpoint;
+  budget?: { limit: number; spent: number; overshoot: number };
+}
+
+export interface NestedWorkflowOptions {
+  /** Stable sibling identity within the parent accounting scope. Whitespace is trimmed. */
+  key?: string;
 }
 
 export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema | undefined> {
@@ -206,14 +307,8 @@ export interface CheckpointOptions {
 
 interface RuntimeState {
   currentPhase?: string;
-  /**
-   * Per-phase soft sub-budgets carved from the run total: phase title -> the
-   * ceiling and the run-wide spent at the moment the budget was declared. A phase
-   * exceeding its ceiling throws TOKEN_BUDGET_EXHAUSTED while the run's overall
-   * budget is untouched. Soft gate (like the global one): spent accrues after each
-   * agent, so an in-flight wave may overshoot slightly.
-   */
-  phaseBudgets: Map<string, { budget: number; startSpent: number; warned: boolean }>;
+  currentPhaseKey?: string;
+  phaseKeys: Map<string, string>;
   logs: string[];
   phases: string[];
   /** Monotonic, assigned at lexical agent() call time — the stable resume key. */
@@ -287,15 +382,26 @@ export async function runWorkflow<T = unknown>(
     onLog: options.onLog,
   });
 
+  const scopeKey = options.scopeKey ?? "root";
+  const accountingScopeKey = options.accountingScopeKey ?? options.phaseScopeKey ?? scopeKey;
+  const operationScopeKey = options.operationScopeKey ?? `${accountingScopeKey}/invocation:${randomUUID()}`;
+  const phaseKeys = new Map<string, string>();
+  for (const declaredPhase of meta.phases ?? []) {
+    if (!phaseKeys.has(declaredPhase.title)) {
+      phaseKeys.set(declaredPhase.title, stablePhaseKey(accountingScopeKey, declaredPhase.title));
+    }
+  }
+  const initialPhase = meta.phases?.[0]?.title;
   const state: RuntimeState = {
     logs: [],
     // When the script declares meta.phases, default the current phase to the
     // first one so agents created before any explicit phase() call still group
     // under a declared phase instead of an orphan "(no phase)" bucket. An
     // explicit phase() (or agent({ phase })) overrides this.
-    phases: meta.phases?.[0]?.title ? [meta.phases[0].title] : [],
-    currentPhase: meta.phases?.[0]?.title,
-    phaseBudgets: new Map(),
+    phases: initialPhase ? [initialPhase] : [],
+    currentPhase: initialPhase,
+    currentPhaseKey: initialPhase ? phaseKeys.get(initialPhase) : undefined,
+    phaseKeys,
     callSeq: 0,
     firstMiss: Number.POSITIVE_INFINITY,
   };
@@ -304,23 +410,13 @@ export async function runWorkflow<T = unknown>(
   const concurrency = normalizeConcurrency(
     options.concurrency ?? Math.max(1, (globalThis.navigator?.hardwareConcurrency ?? 8) - 2),
   );
-  // Global caps + budget are shared with any nested workflow() so they hold across nesting.
-  const initialUsage = options.initialTokenUsage;
-  const shared: SharedRuntime = options.sharedRuntime ?? {
-    limiter: createLimiter(concurrency),
-    agentCount: 0,
-    spent: options.initialTokenSpend ?? initialUsage?.total ?? 0,
-    tokenUsage: {
-      input: initialUsage?.input ?? 0,
-      output: initialUsage?.output ?? 0,
-      total: initialUsage?.total ?? 0,
-      cost: initialUsage?.cost ?? 0,
-      cacheRead: initialUsage?.cacheRead ?? 0,
-      cacheWrite: initialUsage?.cacheWrite ?? 0,
-    },
-    depth: 0,
-  };
+  // Global caps + accounting are shared with any nested workflow() so they hold across nesting.
+  const shared = resolveSharedRuntime(options, concurrency);
   const limiter = shared.limiter;
+  const invocationDepth = options.nestingDepth ?? options.sharedRuntime?.depth ?? 0;
+  const nestedImplicitIdentities = new Set<string>();
+  const nestedExplicitKeys = new Set<string>();
+  let localAgentCount = 0;
 
   // One store instance per run; nested workflow() calls inherit the parent's store
   // so all agents across nesting levels share the same key-value space.
@@ -332,22 +428,32 @@ export async function runWorkflow<T = unknown>(
     logger.log(text);
   };
 
+  const phaseKeyFor = (title: string): string => {
+    const existing = state.phaseKeys.get(title);
+    if (existing) return existing;
+    const key = stablePhaseKey(accountingScopeKey, title);
+    state.phaseKeys.set(title, key);
+    return key;
+  };
+
   const phase = (title: string, phaseOptions?: { budget?: number }) => {
     state.currentPhase = title;
+    state.currentPhaseKey = phaseKeyFor(title);
     if (!state.phases.includes(title)) state.phases.push(title);
-    // Carve a soft sub-budget from the run total for work done under this phase.
-    // Re-declaring re-bases from the current spent (idempotent across resume: the
-    // script re-runs phase() and the ceiling is recomputed from live spent).
+    // Replaying phase() updates the declared ceiling without resetting its
+    // checkpointed charge. UsageController owns the durable phase state.
     if (typeof phaseOptions?.budget === "number" && phaseOptions.budget > 0) {
-      state.phaseBudgets.set(title, { budget: phaseOptions.budget, startSpent: shared.spent, warned: false });
+      shared.usage.declarePhase(state.currentPhaseKey, title, phaseOptions.budget);
+      syncCompatibilityRuntime(shared);
     }
     options.onPhase?.(title);
   };
 
   const budget = Object.freeze({
     total: options.tokenBudget ?? null,
-    spent: () => shared.spent,
-    remaining: () => (options.tokenBudget == null ? Infinity : Math.max(0, options.tokenBudget - shared.spent)),
+    spent: () => shared.usage.usage.total,
+    remaining: () =>
+      options.tokenBudget == null ? Infinity : Math.max(0, options.tokenBudget - shared.usage.usage.total),
   });
 
   const throwIfAborted = () => {
@@ -369,6 +475,12 @@ export async function runWorkflow<T = unknown>(
     }
 
     const assignedPhase = agentOptions.phase ?? state.currentPhase;
+    const assignedPhaseKey = assignedPhase
+      ? agentOptions.phase
+        ? phaseKeyFor(assignedPhase)
+        : (state.currentPhaseKey ?? phaseKeyFor(assignedPhase))
+      : undefined;
+
     const requestedLabel = agentOptions.label?.trim();
 
     // Resolve a named agentType to its bound definition (tools/model/prompt).
@@ -392,16 +504,10 @@ export async function runWorkflow<T = unknown>(
     // Deterministic resume key: assigned at lexical call time, before the limiter,
     // so parallel()/pipeline() fan-out is reproducible for a fixed script.
     const callIndex = state.callSeq++;
+    const callKey = `${scopeKey}/call:${callIndex}`;
+    const accountingCallKey = stableAccountingCallKey(accountingScopeKey, callIndex);
     const callHash = hashAgentCall(prompt, modelSpec, assignedPhase, agentOptions, agentDefinitionKey(agentDef));
-    // Store delta key: callIndex alone is NOT run-unique. A nested workflow()
-    // call (see workflowFn below) shares this run's SharedStore instance but
-    // restarts its own callSeq at 0, so a parent agent and a concurrently
-    // running nested-run agent can both get callIndex 0 and collide in
-    // SharedStore.agentDeltas — whichever commits last steals/overwrites the
-    // other's journaled delta. Composing the run's own runId (unique per
-    // top-level run AND per nested run, see `${runId}-nested${shared.depth}`
-    // below) with callIndex makes the key unique across the whole store.
-    const deltaKey = `${runId}:${callIndex}`;
+    const deltaKey = callKey;
 
     // Reserve the agent slot synchronously — atomic with the limit/budget gate
     // above (no await in between) — so a parallel() fan-out can't all observe the
@@ -409,6 +515,7 @@ export async function runWorkflow<T = unknown>(
     // spent accrues after each agent, matching Claude Code; in-flight agents may
     // push slightly past total, then further agent() calls throw.)
     shared.agentCount++;
+    localAgentCount++;
     const label = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount);
 
     // Longest-unchanged-prefix resume: replay a cached result only while the
@@ -416,58 +523,64 @@ export async function runWorkflow<T = unknown>(
     // call. Once any call misses, it AND everything after it run live (matching
     // Claude Code's contract), so an edited upstream call never leaves stale
     // downstream results served from the journal.
-    const cached = options.resumeJournal?.get(callIndex);
-    const hashMatches = cached != null && cached.hash === callHash;
+    const cached = resumeEntry(options.resumeJournal, {
+      callKey,
+      callIndex,
+      scopeKey: options.scopeKey ?? "root",
+      accountingScopeKey,
+      accountingCallKey,
+      kind: "agent",
+      callHash,
+    });
+    const hashMatches = cached != null;
     const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
     if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
-      options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
-      options.onAgentEnd?.({ label, phase: assignedPhase, result: cached.result, tokens: 0, model: displayModel });
+      const replayTokens = cached.tokens ?? cached.usage?.total ?? 0;
+      shared.usage.addReplay(replayTokens);
+      syncCompatibilityRuntime(shared);
+      options.onJournalReplay?.(cached);
+      options.onAgentStart?.({
+        label,
+        phase: assignedPhase,
+        prompt,
+        model: displayModel,
+        key: callKey,
+        accountingCallKey,
+        replayed: true,
+      });
+      options.onAgentEnd?.({
+        label,
+        phase: assignedPhase,
+        result: cached.result,
+        tokens: replayTokens,
+        model: displayModel,
+        key: callKey,
+        accountingCallKey,
+        replayed: true,
+      });
       // Apply this agent's write delta so live agents later in the run see a
-      // consistent store. Additive apply preserves parallel-agent writes that
-      // came from higher-callIndex agents finishing before this one.
-      if (cached.storeDelta) store.applyDelta(cached.storeDelta);
+      // consistent store. Original sequence metadata preserves cross-agent
+      // last-write-wins ordering even when replay happens in lexical call order.
+      if (cached.storeDelta) store.applyDelta(cached.storeDelta, scopeKey, cached.storeDeltaSequences);
       return cached.result;
     }
     // A genuine miss (no journal entry, or the hash changed) marks where the
     // unchanged prefix ends; this call and every later one then run live.
     if (!hashMatches || cachedEmptyOutput) state.firstMiss = Math.min(state.firstMiss, callIndex);
 
-    // Replay is free and must happen before budget gates: a fully cached run can
-    // finish at zero remaining budget, while the first genuinely fresh call is blocked.
-    if (budget.total !== null && budget.remaining() <= 0) {
-      throw new WorkflowError("workflow token budget exhausted", WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED, {
-        recoverable: false,
-      });
-    }
-
-    // Per-phase soft sub-budget gate: a noisy phase can exhaust its own ceiling
-    // without touching the run's overall budget. Soft (spent accrues post-agent),
-    // warns once at ~80%, throws at 100%. Scripts can try/catch around a phase's
-    // work so later phases still proceed.
-    if (assignedPhase) {
-      const pb = state.phaseBudgets.get(assignedPhase);
-      if (pb) {
-        const phaseSpent = shared.spent - pb.startSpent;
-        if (phaseSpent >= pb.budget) {
-          throw new WorkflowError(
-            `phase "${assignedPhase}" token sub-budget exhausted (${pb.budget})`,
-            WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED,
-            { recoverable: false },
-          );
-        }
-        if (!pb.warned && phaseSpent >= pb.budget * 0.8) {
-          pb.warned = true;
-          log(`phase "${assignedPhase}" at ${Math.round((phaseSpent / pb.budget) * 100)}% of its token sub-budget`);
-        }
-      }
-    }
-
-    return limiter(async () => {
+    const invocation = limiter(async () => {
       const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
       const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
       const maxAttempts = retryAttempts + 1;
 
-      options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
+      options.onAgentStart?.({
+        label,
+        phase: assignedPhase,
+        prompt,
+        model: displayModel,
+        key: callKey,
+        accountingCallKey,
+      });
 
       // Optional per-agent worktree isolation (deterministic name -> stable resume keys).
       // Precedence: explicit call-site isolation > agentDef isolation.
@@ -482,68 +595,94 @@ export async function runWorkflow<T = unknown>(
       }
       const runCwd = worktree?.isolated ? worktree.cwd : undefined;
 
-      // Captured from the subagent's real session usage; falls back to an
-      // estimate when the provider reports no usage (total === 0). Usage is reset
-      // per retry attempt so a failed attempt does not double-count the next one.
-      let usage: AgentUsage | undefined;
-      const recordTokens = (result: unknown): number => {
-        const tokens = usage && usage.total > 0 ? usage.total : estimateTokens(result) + estimateTokens(prompt);
-        if (usage) {
-          shared.tokenUsage.input += usage.input;
-          shared.tokenUsage.output += usage.output;
-          shared.tokenUsage.cost += usage.cost;
-          shared.tokenUsage.cacheRead += usage.cacheRead;
-          shared.tokenUsage.cacheWrite += usage.cacheWrite;
-        }
-        shared.tokenUsage.total += tokens;
-        shared.spent += tokens;
-        return tokens;
-      };
+      const logicalUsage = shared.usage.priorAttemptUsage(callKey, callHash, accountingCallKey, accountingScopeKey);
+      const firstAttemptNumber = shared.usage.nextAttemptNumber(callKey, accountingCallKey, accountingScopeKey);
 
       try {
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-          usage = undefined;
-          try {
-            throwIfAborted();
+          const admissionFailure = shared.usage.admissionFailure(assignedPhaseKey);
+          if (admissionFailure) {
+            const workflowError = budgetError(admissionFailure, shared.usage.usage);
+            options.onAgentEnd?.({
+              label,
+              phase: assignedPhase,
+              result: null,
+              tokens: logicalUsage.total,
+              worktree: runCwd,
+              model: displayModel,
+              error: workflowError.message,
+              errorCode: workflowError.code,
+              recoverable: workflowError.recoverable,
+              key: callKey,
+              accountingCallKey,
+            });
+            throw workflowError;
+          }
+          throwIfAborted();
 
-            // Run agent with timeout
-            const result = await withTimeout(
-              agentRunner.run(prompt, {
-                label,
-                // Identifiable name for persisted sessions (persistAgentSessions).
-                sessionName: `workflow:${runId} ${label}`,
-                schema: agentOptions.schema,
-                signal: options.signal,
-                instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef, resolvedIsolation),
-                model: modelSpec,
-                tier: agentOptions.tier,
-                modelRegistry: options.modelRegistry,
-                toolNames: agentDef?.tools,
-                disallowedToolNames: agentDef?.disallowedTools,
-                // Per-agent store tools track this agent's writes by the
-                // run-unique deltaKey so the delta can be journaled and replayed
-                // correctly on resume, even when a nested workflow() run shares
-                // this store concurrently with the parent run.
-                systemTools: createAgentStoreTools(store, deltaKey),
-                cwd: runCwd,
-                onModelResolved: (id: string) => {
-                  displayModel = id;
-                },
-                onModelFallback: (spec: string) => {
-                  // Make the silent degrade visible in /workflows, not just console.
-                  log(`${label}: model "${spec}" unavailable — using the session default`);
-                },
-                onUsage: (u: AgentUsage) => {
-                  usage = u;
-                },
-                onHistory: (history: AgentHistoryEntry[]) => {
-                  options.onAgentHistory?.({ label, phase: assignedPhase, history });
-                },
-              }),
+          const attemptController = new AbortController();
+          const attemptId = shared.usage.startAttempt(
+            callKey,
+            firstAttemptNumber + attempt - 1,
+            callHash,
+            assignedPhase,
+            attemptController,
+            assignedPhaseKey,
+            accountingScopeKey,
+            operationScopeKey,
+            accountingCallKey,
+          );
+          try {
+            const result = await runAttemptWithSettlement(
+              () =>
+                agentRunner.run(prompt, {
+                  label,
+                  // Identifiable name for persisted sessions (persistAgentSessions).
+                  sessionName: `workflow:${runId} ${label}`,
+                  schema: agentOptions.schema,
+                  signal: attemptController.signal,
+                  instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef, resolvedIsolation),
+                  model: modelSpec,
+                  tier: agentOptions.tier,
+                  modelRegistry: options.modelRegistry,
+                  toolNames: agentDef?.tools,
+                  disallowedToolNames: agentDef?.disallowedTools,
+                  // Per-agent store tools track this agent's writes by the
+                  // run-unique deltaKey so the delta can be journaled and replayed
+                  // correctly on resume, even when a nested workflow() run shares
+                  // this store concurrently with the parent run.
+                  systemTools: createAgentStoreTools(store, deltaKey, scopeKey),
+                  cwd: runCwd,
+                  onModelResolved: (id: string) => {
+                    displayModel = id;
+                  },
+                  onModelFallback: (spec: string) => {
+                    // Make the silent degrade visible in /workflows, not just console.
+                    log(`${label}: model "${spec}" unavailable — using the session default`);
+                  },
+                  onUsage: (usage: AgentUsage) => {
+                    // Final telemetry may arrive only after the provider has
+                    // completed this attempt. Use it to abort concurrent work,
+                    // but let this completed source settle normally.
+                    shared.usage.updateAttempt(attemptId, measuredUsage(usage), true, true);
+                    syncCompatibilityRuntime(shared);
+                  },
+                  onUsageUpdate: (usage: AgentUsage) => {
+                    shared.usage.updateAttempt(attemptId, measuredUsage(usage), true);
+                    syncCompatibilityRuntime(shared);
+                  },
+                  onHistory: (history: AgentHistoryEntry[]) => {
+                    options.onAgentHistory?.({ label, phase: assignedPhase, history, key: callKey, accountingCallKey });
+                  },
+                }),
+              attemptController,
+              options.signal,
               timeout,
               label,
             );
 
+            const liveExhaustion = shared.usage.exhaustionFor(attemptId, false);
+            if (liveExhaustion) throw budgetError(liveExhaustion, shared.usage.usage);
             throwIfAborted();
             if (isEmptyTextAgentResult(result, agentOptions.schema)) {
               throw new WorkflowError("Subagent produced no assistant output", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, {
@@ -552,44 +691,70 @@ export async function runWorkflow<T = unknown>(
               });
             }
 
-            const tokens = recordTokens(result);
+            const attemptUsage = shared.usage.settleAttempt(attemptId, "succeeded", {
+              estimate: estimatedUsage(prompt, result),
+            });
+            syncCompatibilityRuntime(shared);
+            mergeTokenUsage(logicalUsage, attemptUsage);
+            const tokens = logicalUsage.total;
+            const storeDelta = store.commitSequencedDelta(deltaKey);
             options.onAgentJournal?.({
               index: callIndex,
+              key: callKey,
+              kind: "agent",
               hash: callHash,
               result,
-              storeDelta: store.commitDelta(deltaKey),
+              usage: structuredClone(logicalUsage),
+              tokens,
+              agentCount: 1,
+              accountingScopeKey,
+              accountingCallKey,
+              storeDelta: storeDelta.values,
+              storeDeltaSequences: storeDelta.sequences,
             });
             options.onAgentEnd?.({
               label,
               phase: assignedPhase,
               result,
               tokens,
-              tokenUsage: usage,
+              tokenUsage: agentUsageFromTokenUsage(logicalUsage),
               worktree: runCwd,
               model: displayModel,
+              key: callKey,
+              accountingCallKey,
             });
             return result;
           } catch (error) {
-            if (options.signal?.aborted) {
-              // Providers can report usage before the agent promise settles. A
-              // deliberate pause/abort must checkpoint that spend without
-              // fabricating an agent failure event, or resume can spend it again.
-              if (usage) {
-                recordTokens(null);
-                options.onTokenUsage?.(shared.tokenUsage);
-              }
-              throw error;
-            }
-
-            const workflowError = wrapError(error, { agentLabel: label });
+            const liveExhaustion = shared.usage.exhaustionFor(attemptId);
+            const wrapped = wrapError(error, { agentLabel: label });
+            const workflowError = options.signal?.aborted
+              ? new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true })
+              : wrapped.code === WorkflowErrorCode.AGENT_TIMEOUT
+                ? wrapped
+                : liveExhaustion
+                  ? budgetError(liveExhaustion, shared.usage.usage)
+                  : wrapped;
             logger.error(`agent ${label} attempt ${attempt}/${maxAttempts} failed: ${workflowError.message}`);
-            const tokens = recordTokens(null);
+            const attemptStatus =
+              workflowError.code === WorkflowErrorCode.AGENT_TIMEOUT
+                ? "timed_out"
+                : workflowError.code === WorkflowErrorCode.WORKFLOW_ABORTED ||
+                    workflowError.code === WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED
+                  ? "aborted"
+                  : "failed";
+            const attemptUsage = shared.usage.settleAttempt(attemptId, attemptStatus, {
+              error: workflowError.message,
+              estimate: attemptStatus === "aborted" ? undefined : estimatedUsage(prompt, null),
+            });
+            syncCompatibilityRuntime(shared);
+            mergeTokenUsage(logicalUsage, attemptUsage);
+            const tokens = logicalUsage.total;
 
-            if (workflowError.recoverable && attempt < maxAttempts) {
-              // This attempt consumed provider tokens even though it will retry.
-              // Checkpoint cumulative spend now; otherwise a later pause/resume
-              // can incorrectly reclaim the failed attempt's budget.
-              options.onTokenUsage?.(shared.tokenUsage);
+            if (
+              workflowError.recoverable &&
+              workflowError.code !== WorkflowErrorCode.WORKFLOW_ABORTED &&
+              attempt < maxAttempts
+            ) {
               log(
                 `agent "${label}" attempt ${attempt}/${maxAttempts} failed: ${workflowError.code} ${workflowError.message}; retrying`,
               );
@@ -601,14 +766,17 @@ export async function runWorkflow<T = unknown>(
               phase: assignedPhase,
               result: null,
               tokens,
-              tokenUsage: usage,
+              tokenUsage: agentUsageFromTokenUsage(logicalUsage),
               worktree: runCwd,
               model: displayModel,
               error: workflowError.message,
               errorCode: workflowError.code,
               recoverable: workflowError.recoverable,
+              key: callKey,
+              accountingCallKey,
             });
 
+            if (workflowError.code === WorkflowErrorCode.WORKFLOW_ABORTED) throw workflowError;
             if (workflowError.recoverable) {
               log(
                 `agent "${label}" exhausted ${maxAttempts} attempt${maxAttempts === 1 ? "" : "s"}: ${workflowError.code} ${workflowError.message}`,
@@ -624,6 +792,7 @@ export async function runWorkflow<T = unknown>(
         if (worktree?.isolated) await removeWorktree(worktree);
       }
     });
+    return trackRuntimeOperation(shared, operationScopeKey, invocation);
   };
 
   const parallel = async (thunks: Array<() => Promise<unknown>>) => {
@@ -681,35 +850,176 @@ export async function runWorkflow<T = unknown>(
     );
   };
 
-  // Nested workflow(): run a saved workflow (or a raw script) inline, sharing this
-  // run's limiter/counters/budget so the global caps hold. One level deep only.
-  const workflowFn = async (nameOrScript: string, childArgs?: unknown) => {
-    throwIfAborted();
-    if (shared.depth >= 1) {
-      throw new WorkflowError("workflow() can nest only one level deep", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
-        recoverable: false,
-      });
-    }
-    const resolved = options.loadSavedWorkflow?.(String(nameOrScript));
-    const childScript = resolved ?? String(nameOrScript);
-    shared.depth++;
-    try {
-      const child = await runWorkflow(childScript, {
-        ...options,
-        args: childArgs,
-        sharedRuntime: shared,
-        // Propagate the parent's store so nested agents share the same key-value space.
-        sharedStore: store,
-        // A nested run is its own script; never reuse the parent's resume journal.
-        resumeJournal: undefined,
-        resumeFromRunId: undefined,
-        runId: `${runId}-nested${shared.depth}`,
-        persistLogs: false,
-      });
-      return child.result;
-    } finally {
-      shared.depth--;
-    }
+  // Nested workflow(): the wrapper journal remains positional, while accounting
+  // identity is stable. Explicit sibling keys are reorder-safe; an implicit
+  // name/script+args identity is permitted only once in a parent invocation.
+  const workflowFn = (
+    ...workflowArgs: [nameOrScript: string, childArgs?: unknown, childOptions?: NestedWorkflowOptions]
+  ) => {
+    const [nameOrScript, childArgs, childOptions] = workflowArgs;
+    const childArgsProvided = workflowArgs.length >= 2;
+    return trackRuntimeOperation(
+      shared,
+      operationScopeKey,
+      (async () => {
+        throwIfAborted();
+        if (invocationDepth >= 1) {
+          throw new WorkflowError(
+            "workflow() can nest only one level deep",
+            WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+            {
+              recoverable: false,
+            },
+          );
+        }
+        const explicitKey = normalizeNestedWorkflowKey(childOptions);
+        const workflowName = String(nameOrScript);
+        const resolved = options.loadSavedWorkflow?.(workflowName);
+        const childScript = resolved ?? workflowName;
+        const implicitIdentity = hashNestedWorkflowIdentity(
+          resolved === undefined ? undefined : workflowName,
+          childScript,
+          childArgsProvided,
+          childArgs,
+        );
+        let childAccountingScope: string;
+        if (explicitKey !== undefined) {
+          if (nestedExplicitKeys.has(explicitKey)) {
+            throw new WorkflowError(
+              `duplicate workflow() key "${explicitKey}" in one parent; explicit keys must be unique`,
+              WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+              { recoverable: false },
+            );
+          }
+          nestedExplicitKeys.add(explicitKey);
+          childAccountingScope = `${accountingScopeKey}/workflow-key:${sha256(explicitKey)}`;
+        } else {
+          if (nestedImplicitIdentities.has(implicitIdentity)) {
+            throw new WorkflowError(
+              "duplicate implicit workflow() identity in one parent; provide a unique third-argument { key } for identical siblings",
+              WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+              { recoverable: false },
+            );
+          }
+          nestedImplicitIdentities.add(implicitIdentity);
+          // Preserve the only unambiguous legacy scope: implicit occurrence 0.
+          childAccountingScope = `${accountingScopeKey}/workflow:${implicitIdentity}/occurrence:0`;
+        }
+        const childOperationScope = `${childAccountingScope}/invocation:${randomUUID()}`;
+        const callIndex = state.callSeq++;
+        const callKey = `${scopeKey}/call:${callIndex}`;
+        const childJournalScope = `${callKey}/workflow`;
+        const wrapperAccountingCallKey = stableAccountingCallKey(accountingScopeKey, callIndex);
+        const callHash = hashNestedWorkflow(childScript, childArgsProvided, childArgs, explicitKey);
+        // Wrapper checkpoints intentionally remain positional. A keyed wrapper miss
+        // can still reuse stable descendant journals from its accounting scope.
+        const cached = resumeEntry(options.resumeJournal, {
+          callKey,
+          callIndex,
+          scopeKey: options.scopeKey ?? "root",
+          accountingScopeKey: childAccountingScope,
+          kind: "workflow",
+          callHash,
+        });
+        if (cached && callIndex < state.firstMiss) {
+          const replayedAgents = cached.agentCount ?? 0;
+          if (shared.agentCount + replayedAgents > maxAgents) {
+            throw new WorkflowError(`Agent limit exceeded (${maxAgents}).`, WorkflowErrorCode.AGENT_LIMIT_EXCEEDED, {
+              recoverable: false,
+            });
+          }
+          shared.agentCount += replayedAgents;
+          localAgentCount += replayedAgents;
+          const rebasedStoreDelta = cached.storeDelta
+            ? store.applyRebasedDelta(cached.storeDelta, cached.storeDeltaSequences)
+            : undefined;
+          shared.usage.addReplay(cached.tokens ?? cached.usage?.total ?? 0);
+          syncCompatibilityRuntime(shared);
+          const reordered = cached.key !== callKey;
+          const replayedEntry = reordered
+            ? {
+                ...cached,
+                index: callIndex,
+                key: callKey,
+                accountingCallKey: wrapperAccountingCallKey,
+                storeDelta: rebasedStoreDelta?.values ?? cached.storeDelta,
+                storeDeltaSequences: rebasedStoreDelta?.sequences ?? cached.storeDeltaSequences,
+              }
+            : cached;
+          options.onJournalReplay?.(replayedEntry);
+          // Rebase a reordered stable wrapper to its current physical key so the
+          // persisted newest generation supersedes the stale position. Same-key
+          // replay remains callback-compatible and does not rewrite the journal.
+          if (reordered) options.onAgentJournal?.(replayedEntry);
+          return cached.result;
+        }
+        state.firstMiss = Math.min(state.firstMiss, callIndex);
+
+        const legacyJournal = hasAmbiguousLegacyJournal(options.resumeJournal);
+        const keyedJournalMatches =
+          explicitKey === undefined ||
+          cached?.accountingScopeKey === childAccountingScope ||
+          journalHasAccountingScope(options.resumeJournal, childAccountingScope);
+        if (legacyJournal || !keyedJournalMatches) {
+          log(
+            legacyJournal
+              ? "legacy nested journal has ambiguous numeric identities; rerunning nested workflow safely"
+              : `nested workflow key "${explicitKey}" has no matching stable journal identity; starting it fresh`,
+          );
+        }
+        const descendantAgentAccountingCallKeys = new Set<string>();
+        const observeDescendantAgent = (entry: JournalEntry): void => {
+          if (entry.kind === "agent" && entry.accountingCallKey) {
+            descendantAgentAccountingCallKeys.add(entry.accountingCallKey);
+          }
+        };
+        const child = await runWorkflow(childScript, {
+          ...options,
+          args: childArgs,
+          sharedRuntime: shared,
+          sharedStore: store,
+          scopeKey: childJournalScope,
+          accountingScopeKey: childAccountingScope,
+          phaseScopeKey: childAccountingScope,
+          operationScopeKey: childOperationScope,
+          nestingDepth: invocationDepth + 1,
+          resumeJournal: legacyJournal || !keyedJournalMatches ? undefined : options.resumeJournal,
+          resumeFromRunId: options.resumeFromRunId,
+          runId: `${runId}-${callKey.replaceAll("/", "-")}`,
+          persistLogs: false,
+          onAgentStart: (event) => {
+            if (event.accountingCallKey) descendantAgentAccountingCallKeys.add(event.accountingCallKey);
+            options.onAgentStart?.(event);
+          },
+          onAgentJournal: (entry) => {
+            observeDescendantAgent(entry);
+            options.onAgentJournal?.(entry);
+          },
+          onJournalReplay: (entry) => {
+            observeDescendantAgent(entry);
+            options.onJournalReplay?.(entry);
+          },
+        });
+        const storeDelta = store.commitSequencedScopeDeltas(childJournalScope);
+        const childUsage = shared.usage.usageForScope(childAccountingScope);
+        options.onAgentJournal?.({
+          index: callIndex,
+          key: callKey,
+          kind: "workflow",
+          hash: callHash,
+          result: child.result,
+          usage: childUsage,
+          tokens: childUsage.total,
+          agentCount: child.agentCount,
+          descendantAgentAccountingCallKeys: [...descendantAgentAccountingCallKeys],
+          accountingScopeKey: childAccountingScope,
+          accountingCallKey: wrapperAccountingCallKey,
+          storeDelta: storeDelta.values,
+          storeDeltaSequences: storeDelta.sequences,
+        });
+        return child.result;
+      })(),
+    );
   };
 
   // ── Quality-pattern stdlib: reusable, deterministic helpers built purely on
@@ -871,42 +1181,69 @@ export async function runWorkflow<T = unknown>(
   // replays by callIndex exactly like a cached agent() — the genuine edge over CC,
   // whose steering is in-session only. Headless (no UI threaded in): takes the
   // declared default and journals THAT, so a detached/background run never hangs.
-  const checkpoint = async (promptText: string, checkpointOptions: CheckpointOptions = {}) => {
-    throwIfAborted();
-    if (typeof promptText !== "string") throw new TypeError("checkpoint(promptText, options?) needs a prompt string");
-    if (shared.agentCount >= maxAgents) {
-      throw new WorkflowError(
-        `Agent limit exceeded (${maxAgents}). Use maxAgents option to increase the limit.`,
-        WorkflowErrorCode.AGENT_LIMIT_EXCEEDED,
-        { recoverable: false },
-      );
-    }
-    const callIndex = state.callSeq++;
-    const callHash = hashCheckpoint(promptText, checkpointOptions);
-    const cached = options.resumeJournal?.get(callIndex);
-    if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
-      shared.agentCount++;
-      return cached.result; // replay the journaled human reply
-    }
-    if (cached == null || cached.hash !== callHash) state.firstMiss = Math.min(state.firstMiss, callIndex);
-    shared.agentCount++;
+  const checkpoint = (promptText: string, checkpointOptions: CheckpointOptions = {}) =>
+    trackRuntimeOperation(
+      shared,
+      operationScopeKey,
+      (async () => {
+        throwIfAborted();
+        if (typeof promptText !== "string")
+          throw new TypeError("checkpoint(promptText, options?) needs a prompt string");
+        if (shared.agentCount >= maxAgents) {
+          throw new WorkflowError(
+            `Agent limit exceeded (${maxAgents}). Use maxAgents option to increase the limit.`,
+            WorkflowErrorCode.AGENT_LIMIT_EXCEEDED,
+            { recoverable: false },
+          );
+        }
+        const callIndex = state.callSeq++;
+        const callKey = `${scopeKey}/call:${callIndex}`;
+        const accountingCallKey = stableAccountingCallKey(accountingScopeKey, callIndex);
+        const callHash = hashCheckpoint(promptText, checkpointOptions);
+        const cached = resumeEntry(options.resumeJournal, {
+          callKey,
+          callIndex,
+          scopeKey: options.scopeKey ?? "root",
+          accountingScopeKey,
+          accountingCallKey,
+          kind: "checkpoint",
+          callHash,
+        });
+        if (cached != null && callIndex < state.firstMiss) {
+          shared.agentCount++;
+          localAgentCount++;
+          options.onJournalReplay?.(cached);
+          return cached.result; // replay the journaled human reply
+        }
+        if (cached == null) state.firstMiss = Math.min(state.firstMiss, callIndex);
+        shared.agentCount++;
+        localAgentCount++;
 
-    let reply: unknown;
-    if (options.confirm) {
-      reply = await options.confirm(promptText, checkpointOptions);
-    } else if (checkpointOptions.headless === "abort") {
-      throw new WorkflowError(
-        `checkpoint "${promptText}" needs human input but none is available (headless run)`,
-        WorkflowErrorCode.WORKFLOW_ABORTED,
-        { recoverable: false },
-      );
-    } else {
-      reply = checkpointOptions.default ?? true;
-    }
-    throwIfAborted();
-    options.onAgentJournal?.({ index: callIndex, hash: callHash, result: reply });
-    return reply;
-  };
+        let reply: unknown;
+        if (options.confirm) {
+          reply = await options.confirm(promptText, checkpointOptions);
+        } else if (checkpointOptions.headless === "abort") {
+          throw new WorkflowError(
+            `checkpoint "${promptText}" needs human input but none is available (headless run)`,
+            WorkflowErrorCode.WORKFLOW_ABORTED,
+            { recoverable: false },
+          );
+        } else {
+          reply = checkpointOptions.default ?? true;
+        }
+        throwIfAborted();
+        options.onAgentJournal?.({
+          index: callIndex,
+          key: callKey,
+          kind: "checkpoint",
+          hash: callHash,
+          result: reply,
+          accountingScopeKey,
+          accountingCallKey,
+        });
+        return reply;
+      })(),
+    );
 
   const context = vm.createContext({
     agent,
@@ -940,7 +1277,46 @@ export async function runWorkflow<T = unknown>(
 
   const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
   try {
-    const result = await new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(context);
+    let result: unknown;
+    let scriptFailure: unknown;
+    let scriptFailed = false;
+    try {
+      result = await new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(context);
+    } catch (error) {
+      scriptFailed = true;
+      scriptFailure = error;
+    }
+
+    // Native Promise.all is fail-fast and can discard sibling operations. Every
+    // invocation drains only its own descendants; the root additionally owns the
+    // global registry used by manager lease/deletion safety.
+    const liveFailures =
+      invocationDepth === 0
+        ? await settleLiveInvocations(shared)
+        : await settleOwnedOperations(shared, operationScopeKey);
+    // Resolve terminal state only after owned operations drain. Parent abort is
+    // always terminal. Otherwise an uncaught script/runner error remains the
+    // primary failure. Budget exhaustion is the final-only gate when the script
+    // otherwise succeeds or catches/recoverably consumes an agent failure.
+    if (options.signal?.aborted) {
+      throw new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true });
+    }
+    const terminalExhaustion = shared.usage.terminalExhaustion(accountingScopeKey);
+    if (scriptFailed) {
+      const failure = wrapError(scriptFailure);
+      if (failure.code === WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED && terminalExhaustion) {
+        throw budgetError(terminalExhaustion, shared.usage.usage);
+      }
+      throw scriptFailure;
+    }
+    if (liveFailures.length > 0) {
+      const failure = wrapError(liveFailures[0]);
+      if (failure.code === WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED && terminalExhaustion) {
+        throw budgetError(terminalExhaustion, shared.usage.usage);
+      }
+      throw liveFailures[0];
+    }
+    if (terminalExhaustion) throw budgetError(terminalExhaustion, shared.usage.usage);
 
     // Persist logs
     const logFile = logger.persist();
@@ -948,24 +1324,167 @@ export async function runWorkflow<T = unknown>(
       log(`Logs persisted to ${logFile}`);
     }
 
-    // Emit final token usage
-    options.onTokenUsage?.(shared.tokenUsage);
+    syncCompatibilityRuntime(shared);
+    const runtimeCheckpoint = shared.usage.checkpoint();
+    options.onRuntimeCheckpoint?.(runtimeCheckpoint);
+    options.onTokenUsage?.(runtimeCheckpoint.usage);
+    const budgetStatus =
+      options.tokenBudget == null
+        ? undefined
+        : {
+            limit: options.tokenBudget,
+            spent: runtimeCheckpoint.usage.total,
+            overshoot: Math.max(0, runtimeCheckpoint.usage.total - options.tokenBudget),
+          };
 
     return {
       meta,
       result: result as T,
       logs: state.logs,
       phases: state.phases,
-      agentCount: shared.agentCount,
+      agentCount: invocationDepth > 0 ? localAgentCount : shared.agentCount,
       durationMs: Date.now() - started,
       runId,
-      tokenUsage: shared.tokenUsage,
+      tokenUsage: runtimeCheckpoint.usage,
+      runtimeCheckpoint,
+      budget: budgetStatus,
     };
   } finally {
-    // Dispose the store only when this run created it; nested runs inherit the
-    // parent's store and must not tear it down while the parent is still running.
+    // Dispose the store only when this run created it, and only after the root
+    // ownership drain above has observed every live invocation settle.
     if (!options.sharedStore) store.dispose();
   }
+}
+
+function resolveSharedRuntime(options: WorkflowRunOptions, concurrency: number): ActiveSharedRuntime {
+  const provided = options.sharedRuntime;
+  let shared: ActiveSharedRuntime;
+  const initialUsage = options.initialTokenUsage;
+  const restoredInitialUsage =
+    initialUsage && (initialUsage as Partial<TokenUsage>).schemaVersion === 1
+      ? restoreTokenUsage(initialUsage as TokenUsage)
+      : restoreTokenUsage({
+          input: initialUsage?.input ?? 0,
+          output: initialUsage?.output ?? 0,
+          total: Math.max(initialUsage?.total ?? 0, options.initialTokenSpend ?? 0),
+          cost: initialUsage?.cost ?? 0,
+          cacheRead: initialUsage?.cacheRead ?? 0,
+          cacheWrite: initialUsage?.cacheWrite ?? 0,
+        });
+  const initialCheckpoint =
+    options.runtimeCheckpoint ??
+    (provided
+      ? {
+          schemaVersion: 1 as const,
+          usage: restoreTokenUsage(provided.tokenUsage),
+          phaseBudgets: {},
+          attempts: {},
+        }
+      : initialUsage || options.initialTokenSpend !== undefined
+        ? {
+            schemaVersion: 1 as const,
+            usage: restoredInitialUsage,
+            phaseBudgets: {},
+            attempts: {},
+          }
+        : undefined);
+  const usage =
+    provided?.usage ??
+    new UsageController({
+      tokenBudget: options.tokenBudget,
+      checkpoint: initialCheckpoint,
+      onChange: (checkpoint) => {
+        if (shared) syncCompatibilityRuntime(shared);
+        options.onRuntimeCheckpoint?.(checkpoint);
+      },
+    });
+
+  if (provided) {
+    provided.usage = usage;
+    provided.liveInvocations ??= new Set<Promise<unknown>>();
+    provided.liveOperationsByScope ??= new Map<string, Set<Promise<unknown>>>();
+    provided.tokenUsage = usage.usage;
+    shared = provided as ActiveSharedRuntime;
+  } else {
+    shared = {
+      limiter: createLimiter(concurrency),
+      agentCount: 0,
+      spent: usage.usage.total,
+      tokenUsage: usage.usage,
+      depth: options.nestingDepth ?? 0,
+      usage,
+      liveInvocations: new Set<Promise<unknown>>(),
+      liveOperationsByScope: new Map<string, Set<Promise<unknown>>>(),
+    };
+  }
+  syncCompatibilityRuntime(shared);
+  return shared;
+}
+
+function syncCompatibilityRuntime(shared: ActiveSharedRuntime): void {
+  shared.spent = shared.usage.usage.total;
+  shared.tokenUsage = shared.usage.usage;
+}
+
+function trackRuntimeOperation<T>(
+  shared: ActiveSharedRuntime,
+  ownerScopeKey: string,
+  operation: Promise<T>,
+): Promise<T> {
+  shared.liveInvocations.add(operation);
+  let owned = shared.liveOperationsByScope.get(ownerScopeKey);
+  if (!owned) {
+    owned = new Set<Promise<unknown>>();
+    shared.liveOperationsByScope.set(ownerScopeKey, owned);
+  }
+  owned.add(operation);
+  const release = () => {
+    shared.liveInvocations.delete(operation);
+    owned?.delete(operation);
+    if (owned?.size === 0 && shared.liveOperationsByScope.get(ownerScopeKey) === owned) {
+      shared.liveOperationsByScope.delete(ownerScopeKey);
+    }
+  };
+  void operation.then(release, release);
+  return operation;
+}
+
+async function settleOwnedOperations(shared: ActiveSharedRuntime, ownerScopeKey: string): Promise<unknown[]> {
+  const failures: unknown[] = [];
+  do {
+    const owned = shared.liveOperationsByScope.get(ownerScopeKey);
+    const settled = await Promise.allSettled([...(owned ?? [])]);
+    for (const result of settled) {
+      if (result.status === "rejected") failures.push(result.reason);
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  } while ((shared.liveOperationsByScope.get(ownerScopeKey)?.size ?? 0) > 0);
+  const owned = shared.liveOperationsByScope.get(ownerScopeKey);
+  if (!owned || owned.size === 0) shared.liveOperationsByScope.delete(ownerScopeKey);
+  return failures;
+}
+
+async function settleLiveInvocations(shared: ActiveSharedRuntime): Promise<unknown[]> {
+  const failures: unknown[] = [];
+  do {
+    const settled = await Promise.allSettled([...shared.liveInvocations]);
+    for (const result of settled) {
+      if (result.status === "rejected") failures.push(result.reason);
+    }
+    // A settled checkpoint/workflow can resume a native-Promise branch whose
+    // continuation registers another runtime operation. Observe one complete
+    // event-loop turn before declaring the ownership registry stably empty.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  } while (shared.liveInvocations.size > 0);
+  return failures;
+}
+
+function stablePhaseKey(scopeKey: string, title: string): string {
+  return `${scopeKey}/phase:${encodeURIComponent(title)}`;
+}
+
+function stableAccountingCallKey(accountingScopeKey: string, callIndex: number): string {
+  return `${accountingScopeKey}/call:${callIndex}`;
 }
 
 export function parseWorkflowScript(script: string): { meta: WorkflowMeta; body: string } {
@@ -1172,6 +1691,43 @@ function estimateTokens(value: unknown): number {
   return Math.ceil(JSON.stringify(value ?? "").length / 4);
 }
 
+function estimatedUsage(prompt: string, result: unknown): UsageSample {
+  return {
+    input: 0,
+    output: 0,
+    total: estimateTokens(prompt) + estimateTokens(result),
+    cost: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    provenance: "estimated",
+  };
+}
+
+function agentUsageFromTokenUsage(usage: TokenUsage): AgentUsage {
+  return {
+    input: usage.input,
+    output: usage.output,
+    total: usage.total,
+    cost: usage.cost,
+    cacheRead: usage.cacheRead,
+    cacheWrite: usage.cacheWrite,
+    reasoning: usage.accounting.reasoning.tokens,
+  };
+}
+
+function measuredUsage(usage: AgentUsage): UsageSample {
+  return {
+    input: usage.input,
+    output: usage.output,
+    total: usage.total,
+    cost: usage.cost,
+    cacheRead: usage.cacheRead,
+    cacheWrite: usage.cacheWrite,
+    reasoning: usage.reasoning,
+    provenance: "measured",
+  };
+}
+
 function normalizeConcurrency(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 1) return 1;
   return Math.min(MAX_CONCURRENCY, Math.floor(value));
@@ -1182,29 +1738,308 @@ function normalizeAgentRetries(value: unknown): number {
   return Math.min(MAX_AGENT_RETRIES, Math.floor(value));
 }
 
-/**
- * Run a promise with a timeout.
- */
-async function withTimeout<T>(promise: Promise<T>, ms: number | null, label: string): Promise<T> {
-  if (ms === null) return promise;
-
+/** Abort on timeout/parent cancellation, then await the runner's actual settlement. */
+async function runAttemptWithSettlement<T>(
+  run: () => Promise<T>,
+  controller: AbortController,
+  parentSignal: AbortSignal | undefined,
+  ms: number | null,
+  label: string,
+): Promise<T> {
+  let timedOut = false;
   let timeoutId: NodeJS.Timeout | undefined;
-
-  const timeoutPromise = new Promise<never>((_, reject) => {
+  const abortFromParent = () => controller.abort(parentSignal?.reason);
+  if (parentSignal?.aborted) abortFromParent();
+  else parentSignal?.addEventListener("abort", abortFromParent, { once: true });
+  if (ms !== null) {
     timeoutId = setTimeout(() => {
-      reject(
-        new WorkflowError(
-          `Agent "${label}" timed out after ${ms}ms; raise or omit timeoutMs/agentTimeoutMs to allow longer runs`,
-          WorkflowErrorCode.AGENT_TIMEOUT,
-          { recoverable: true },
-        ),
-      );
+      timedOut = true;
+      controller.abort(new Error(`Agent ${label} timed out`));
     }, ms);
-  });
+  }
 
+  let result: T | undefined;
+  let failure: unknown;
   try {
-    return await Promise.race([promise, timeoutPromise]);
+    result = await run();
+  } catch (error) {
+    failure = error;
   } finally {
     if (timeoutId) clearTimeout(timeoutId);
+    parentSignal?.removeEventListener("abort", abortFromParent);
   }
+
+  if (parentSignal?.aborted) {
+    throw new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true });
+  }
+  if (timedOut) {
+    throw new WorkflowError(
+      `Agent "${label}" timed out after ${ms}ms; raise or omit timeoutMs/agentTimeoutMs to allow longer runs`,
+      WorkflowErrorCode.AGENT_TIMEOUT,
+      { recoverable: true, agentLabel: label },
+    );
+  }
+  if (failure !== undefined) throw failure;
+  return result as T;
+}
+
+interface ResumeEntryIdentity {
+  callKey: string;
+  callIndex: number;
+  scopeKey: string;
+  accountingScopeKey?: string;
+  accountingCallKey?: string;
+  kind: NonNullable<JournalEntry["kind"]>;
+  callHash: string;
+}
+
+function resumeEntry(
+  journal: Map<string | number, JournalEntry> | undefined,
+  expected: ResumeEntryIdentity,
+): JournalEntry | undefined {
+  if (!journal) return undefined;
+  const entries = [...journal.values()];
+  const kindMatches = (entry: JournalEntry): boolean => entry.kind === expected.kind;
+  const hashMatches = (entry: JournalEntry): boolean => entry.hash === expected.callHash;
+
+  // Stable identities are authoritative and historical journals may contain
+  // several physical generations after keyed sibling reorders. Search newest
+  // first, and require the logical kind + call revision to match as well.
+  const stable = [...entries].reverse().find((entry) => {
+    if (!kindMatches(entry) || !hashMatches(entry)) return false;
+    if (expected.kind === "workflow" && expected.accountingScopeKey) {
+      return entry.accountingScopeKey === expected.accountingScopeKey;
+    }
+    return expected.accountingCallKey !== undefined && entry.accountingCallKey === expected.accountingCallKey;
+  });
+  if (stable) return stable;
+
+  const positional = [...entries]
+    .reverse()
+    .find(
+      (entry) =>
+        (entry.key === expected.callKey ||
+          (expected.scopeKey === "root" && entry.key === undefined && entry.index === expected.callIndex)) &&
+        hashMatches(entry) &&
+        (entry.kind === undefined || kindMatches(entry)),
+    );
+  if (!positional) return undefined;
+
+  // Once the caller has a stable accounting identity, a positional entry from
+  // another keyed sibling is never a compatibility fallback. Metadata-free
+  // legacy entries remain replayable.
+  if (
+    expected.accountingScopeKey !== undefined &&
+    positional.accountingScopeKey !== undefined &&
+    positional.accountingScopeKey !== expected.accountingScopeKey
+  ) {
+    return undefined;
+  }
+  if (
+    expected.accountingCallKey !== undefined &&
+    positional.accountingCallKey !== undefined &&
+    positional.accountingCallKey !== expected.accountingCallKey
+  ) {
+    return undefined;
+  }
+  return positional;
+}
+
+function journalHasAccountingScope(
+  journal: Map<string | number, JournalEntry> | undefined,
+  accountingScopeKey: string,
+): boolean {
+  return journal ? [...journal.values()].some((entry) => entry.accountingScopeKey === accountingScopeKey) : false;
+}
+
+function hasAmbiguousLegacyJournal(journal: Map<string | number, JournalEntry> | undefined): boolean {
+  if (!journal) return false;
+  return [...journal.entries()].some(([key, entry]) => typeof key === "number" || !entry.key);
+}
+
+function hashNestedWorkflow(script: string, argsProvided: boolean, args: unknown, explicitKey?: string): string {
+  return sha256(
+    canonicalEncode(
+      explicitKey === undefined
+        ? { script, args: nestedArgsIdentity(argsProvided, args) }
+        : { script, args: nestedArgsIdentity(argsProvided, args), key: explicitKey },
+      "workflow identity",
+    ),
+  );
+}
+
+function normalizeNestedWorkflowKey(options: NestedWorkflowOptions | undefined): string | undefined {
+  if (options === undefined) return undefined;
+  if (options === null || typeof options !== "object") {
+    throw new WorkflowError(
+      "workflow() third argument must be an options object",
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  }
+  if (options.key === undefined) return undefined;
+  if (typeof options.key !== "string" || options.key.trim().length === 0) {
+    throw new WorkflowError(
+      "workflow() third-argument key must be a non-empty string",
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  }
+  return options.key.trim();
+}
+
+function hashNestedWorkflowIdentity(
+  savedName: string | undefined,
+  script: string,
+  argsProvided: boolean,
+  args: unknown,
+): string {
+  const workflowIdentity = savedName === undefined ? { rawScript: sha256(script) } : { savedWorkflow: savedName };
+  return sha256(
+    canonicalEncode({ workflowIdentity, args: nestedArgsIdentity(argsProvided, args) }, "workflow identity"),
+  );
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function nestedArgsIdentity(provided: boolean, value: unknown): unknown {
+  return provided ? ["provided", value] : ["omitted"];
+}
+
+/** Collision-resistant typed canonical encoding for nested workflow identity. */
+function canonicalEncode(value: unknown, rootPath: string): string {
+  const ancestors = new WeakSet<object>();
+  const encode = (item: unknown, path: string): unknown => {
+    if (item === null) return ["null"];
+    if (item === undefined) return ["undefined"];
+    if (typeof item === "string") return ["string", item];
+    if (typeof item === "boolean") return ["boolean", item];
+    if (typeof item === "number") {
+      if (Number.isNaN(item)) return ["number", "nan"];
+      if (item === Number.POSITIVE_INFINITY) return ["number", "+infinity"];
+      if (item === Number.NEGATIVE_INFINITY) return ["number", "-infinity"];
+      if (Object.is(item, -0)) return ["number", "-0"];
+      return ["number", item];
+    }
+    if (typeof item === "bigint" || typeof item === "function" || typeof item === "symbol") {
+      throw invalidNestedIdentity(`${path} contains unsupported ${typeof item}; pass data-only JSON-like values`);
+    }
+    if (typeof item !== "object") {
+      throw invalidNestedIdentity(`${path} contains unsupported value type ${typeof item}`);
+    }
+    if (ancestors.has(item)) {
+      throw invalidNestedIdentity(`${path} is cyclic; nested workflow args must be acyclic`);
+    }
+    ancestors.add(item);
+    try {
+      if (Array.isArray(item)) {
+        assertNativeDataPrototype(item, "Array", path);
+        const descriptors = Object.getOwnPropertyDescriptors(item);
+        for (const key of Reflect.ownKeys(descriptors)) {
+          if (typeof key === "symbol") {
+            throw invalidNestedIdentity(`${path} array contains unsupported symbol properties`);
+          }
+          const descriptor = descriptors[key];
+          if (key === "length") {
+            if (
+              !("value" in descriptor) ||
+              descriptor.enumerable ||
+              descriptor.configurable ||
+              descriptor.writable !== true
+            ) {
+              throw invalidNestedIdentity(`${path} has a non-standard array length property`);
+            }
+            continue;
+          }
+          if (!isArrayIndex(key, item.length)) {
+            throw invalidNestedIdentity(`${path} array contains custom property ${JSON.stringify(key)}`);
+          }
+          assertEnumerableDataDescriptor(descriptor, `${path}[${key}]`);
+        }
+        return [
+          "array",
+          Array.from({ length: item.length }, (_, index) => {
+            const descriptor = descriptors[String(index)];
+            return descriptor ? encode(descriptor.value, `${path}[${index}]`) : ["hole"];
+          }),
+        ];
+      }
+
+      const prototype = Object.getPrototypeOf(item);
+      if (prototype !== null) assertNativeDataPrototype(item, "Object", path);
+      const descriptors = Object.getOwnPropertyDescriptors(item);
+      const encoded: Array<[string, unknown]> = [];
+      for (const key of Reflect.ownKeys(descriptors)) {
+        if (typeof key === "symbol") {
+          throw invalidNestedIdentity(`${path} object contains unsupported symbol properties`);
+        }
+        const descriptor = descriptors[key];
+        assertEnumerableDataDescriptor(descriptor, `${path}.${key}`);
+        encoded.push([key, encode(descriptor.value, `${path}.${key}`)]);
+      }
+      encoded.sort(([left], [right]) => left.localeCompare(right));
+      return ["object", encoded];
+    } finally {
+      ancestors.delete(item);
+    }
+  };
+  return JSON.stringify(encode(value, rootPath));
+}
+
+function assertNativeDataPrototype(item: object, expectedName: "Array" | "Object", path: string): void {
+  const prototype = Object.getPrototypeOf(item);
+  const constructorDescriptor = prototype && Object.getOwnPropertyDescriptor(prototype, "constructor");
+  const prototypeConstructor =
+    constructorDescriptor && "value" in constructorDescriptor ? constructorDescriptor.value : undefined;
+  const source =
+    typeof prototypeConstructor === "function" ? Function.prototype.toString.call(prototypeConstructor) : "";
+  if (
+    !constructorDescriptor ||
+    !("value" in constructorDescriptor) ||
+    constructorDescriptor.enumerable ||
+    typeof prototypeConstructor !== "function" ||
+    prototypeConstructor.name !== expectedName ||
+    prototypeConstructor.prototype !== prototype ||
+    !source.includes("[native code]")
+  ) {
+    throw invalidNestedIdentity(`${path} must use a plain ${expectedName.toLowerCase()} data prototype`);
+  }
+}
+
+function assertEnumerableDataDescriptor(descriptor: PropertyDescriptor, path: string): void {
+  if (!("value" in descriptor)) {
+    throw invalidNestedIdentity(`${path} is an accessor; getters and setters are not allowed`);
+  }
+  if (!descriptor.enumerable) {
+    throw invalidNestedIdentity(`${path} is non-enumerable; only enumerable data properties are allowed`);
+  }
+}
+
+function isArrayIndex(key: string, length: number): boolean {
+  if (!/^(0|[1-9]\d*)$/.test(key)) return false;
+  const index = Number(key);
+  return Number.isSafeInteger(index) && index >= 0 && index < length && String(index) === key;
+}
+
+function invalidNestedIdentity(message: string): WorkflowError {
+  return new WorkflowError(`Invalid nested workflow args: ${message}`, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
+    recoverable: false,
+  });
+}
+
+function budgetError(exhaustion: BudgetExhaustion, usage: TokenUsage): WorkflowError {
+  const subject =
+    exhaustion.scope === "phase" ? `phase "${exhaustion.phase}" token sub-budget` : "workflow token budget";
+  return new WorkflowError(
+    `${subject} exhausted at ${exhaustion.spent} tokens (best-effort ceiling ${exhaustion.limit}, overshoot ${exhaustion.overshoot})`,
+    WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED,
+    {
+      recoverable: false,
+      details: { exhaustion, usage: structuredClone(usage) },
+      usage: structuredClone(usage),
+      overshoot: exhaustion.overshoot,
+    },
+  );
 }

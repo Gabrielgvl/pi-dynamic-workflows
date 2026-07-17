@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
+import type { RuntimeCheckpoint } from "../src/usage.js";
 import { type JournalEntry, runWorkflow } from "../src/workflow.js";
 
 /** Agent runner that counts real invocations and echoes a per-call result. */
@@ -497,20 +498,22 @@ return { err }`;
   assert.match(result.result.err, /one level deep/);
 });
 
-test("runWorkflow budget gates on accumulated tokens", async () => {
+test("runWorkflow budget exhaustion remains terminal when a later admission error is caught", async () => {
   const script = `export const meta = { name: 'budget_demo', description: 'budget' }
-const a = await agent('first', { label: 'a' })
+await agent('first', { label: 'a' })
 let second = null
 try { second = await agent('second', { label: 'b' }) } catch (e) { second = 'blocked' }
-return { a, second }`;
+return { second }`;
 
-  const result = await runWorkflow<{ a: unknown; second: unknown }>(script, {
-    agent: fakeAgent({ input: 100, output: 0, total: 100, cost: 0 }),
-    tokenBudget: 100,
-    persistLogs: false,
-  });
-
-  assert.equal(result.result.second, "blocked");
+  await assert.rejects(
+    () =>
+      runWorkflow(script, {
+        agent: fakeAgent({ input: 100, output: 0, total: 100, cost: 0 }),
+        tokenBudget: 100,
+        persistLogs: false,
+      }),
+    (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED,
+  );
 });
 
 test("resume accounting is cumulative and cached replay completes at zero remaining budget", async () => {
@@ -554,7 +557,9 @@ return { value, total: budget.total, spent: budget.spent(), remaining: budget.re
   assert.equal(resumed.result.total, 100);
   assert.equal(resumed.result.spent, 100);
   assert.equal(resumed.result.remaining, 0);
-  assert.deepEqual(resumed.tokenUsage, first.tokenUsage, "replay adds zero and result usage stays cumulative");
+  assert.equal(resumed.tokenUsage?.total, first.tokenUsage?.total, "replay adds zero billable usage");
+  assert.equal(resumed.tokenUsage?.cost, first.tokenUsage?.cost, "replay adds zero cost");
+  assert.equal(resumed.tokenUsage?.accounting?.journalReplay, 100, "replayed work remains visible in telemetry");
 });
 
 test("resume blocks fresh work when cumulative spend has exhausted the original budget", async () => {
@@ -617,23 +622,24 @@ return xs`;
   );
 });
 
-test("phase sub-budget throws when a phase exceeds its ceiling (run total untouched)", async () => {
+test("phase sub-budget exhaustion remains terminal after a caught error", async () => {
   const script = `export const meta = { name: 'pb', description: 'phase budget' }
 phase('noisy', { budget: 100 })
-let blocked = false
 try {
   await agent('a', { label: '1' })
   await agent('b', { label: '2' })
-} catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
+} catch {}
 phase('calm')
-const after = await agent('c', { label: '3' })
-return { blocked, after }`;
-  const res = await runWorkflow<{ blocked: boolean; after: unknown }>(script, {
-    agent: fakeAgent({ input: 100, output: 0, total: 100, cost: 0 }),
-    persistLogs: false,
-  });
-  assert.equal(res.result.blocked, true, "the 2nd agent in the phase hit the sub-budget");
-  assert.ok(res.result.after !== null, "a later phase still proceeds");
+await agent('c', { label: '3' })
+return 'done'`;
+  await assert.rejects(
+    () =>
+      runWorkflow(script, {
+        agent: fakeAgent({ input: 100, output: 0, total: 100, cost: 0 }),
+        persistLogs: false,
+      }),
+    (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED,
+  );
 });
 
 test("maxAgents is enforced under a parallel() fan-out (atomic slot reservation)", async () => {
@@ -922,4 +928,361 @@ return { escaped, arr, j, s }`;
   // ({}).constructor.constructor is the vm Function; its code runs in the vm realm
   // where Date.now is neutered -> blocked (the old host-object escape is closed).
   assert.match(r.result.escaped, /blocked/, "constructor escape via vm objects is closed");
+});
+
+// ─── Versioned accounting, cancellation, and hierarchical resume ──────────────
+
+test("retry attempts are charged once each and reported on the logical agent", async () => {
+  let calls = 0;
+  let logicalTokens = 0;
+  const result = await runWorkflow(
+    `export const meta = { name: 'retry_usage', description: 'retry accounting' }
+return await agent('work', { label: 'worker', retries: 1 })`,
+    {
+      agent: {
+        async run(_prompt: string, options: { onUsage?: (usage: AgentUsage) => void }) {
+          calls++;
+          const total = calls === 1 ? 30 : 40;
+          options.onUsage?.({ input: total, output: 0, total, cost: 0, cacheRead: 0, cacheWrite: 0 });
+          return calls === 1 ? "" : "ok";
+        },
+      },
+      persistLogs: false,
+      onAgentEnd: (event) => {
+        logicalTokens = event.tokens ?? 0;
+      },
+    },
+  );
+
+  assert.equal(result.result, "ok");
+  assert.equal(result.tokenUsage?.total, 70);
+  assert.equal(logicalTokens, 70, "the compatibility callback must aggregate all attempts");
+});
+
+test("budget admission runs inside the limiter and blocks already-queued live work", async () => {
+  let calls = 0;
+  const script = `export const meta = { name: 'queued_budget', description: 'queued admission' }
+return await parallel([0, 1, 2].map((i) => () => agent('work-' + i, { label: 'a' + i })))`;
+
+  await assert.rejects(
+    () =>
+      runWorkflow(script, {
+        concurrency: 1,
+        tokenBudget: 60,
+        agent: {
+          async run(_prompt: string, options: { onUsage?: (usage: AgentUsage) => void }) {
+            calls++;
+            options.onUsage?.({ input: 60, output: 0, total: 60, cost: 0, cacheRead: 0, cacheWrite: 0 });
+            return "ok";
+          },
+        },
+        persistLogs: false,
+      }),
+    (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED,
+  );
+  assert.equal(calls, 1, "queued agents must re-check the ceiling immediately before their attempt");
+});
+
+test("timeout aborts and settles the attempt before starting its retry", async () => {
+  const firstSettled = createDeferred<void>();
+  let attemptAborted = false;
+  let calls = 0;
+  const run = runWorkflow(
+    `export const meta = { name: 'settled_timeout', description: 'settle before retry' }
+return await agent('slow', { label: 'slow', timeoutMs: 5, retries: 1 })`,
+    {
+      agent: {
+        async run(_prompt: string, options: { signal?: AbortSignal }) {
+          calls++;
+          if (calls === 2) return "retried";
+          options.signal?.addEventListener(
+            "abort",
+            () => {
+              attemptAborted = true;
+            },
+            { once: true },
+          );
+          await firstSettled.promise;
+          return "late";
+        },
+      },
+      persistLogs: false,
+    },
+  );
+
+  let runSettled = false;
+  void run.then(
+    () => {
+      runSettled = true;
+    },
+    () => {
+      runSettled = true;
+    },
+  );
+  const safetyRelease = setTimeout(() => firstSettled.resolve(), 50);
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  try {
+    assert.equal(attemptAborted, true, "timeout aborts the per-attempt signal");
+    assert.equal(runSettled, false, "the logical attempt remains blocked until the custom runner settles");
+    assert.equal(calls, 1, "the retry must not overlap the timed-out attempt");
+  } finally {
+    clearTimeout(safetyRelease);
+    firstSettled.resolve();
+  }
+  const result = await run;
+  assert.equal(result.result, "retried");
+  assert.equal(calls, 2);
+});
+
+test("retry admission rechecks the cumulative budget after a failed attempt", async () => {
+  let calls = 0;
+  let ended: { errorCode?: WorkflowErrorCode; tokens?: number } | undefined;
+
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'retry_budget', description: 'retry budget admission' }
+return await agent('work', { label: 'worker', retries: 1 })`,
+        {
+          tokenBudget: 50,
+          agent: {
+            async run(_prompt: string, options: { onUsage?: (usage: AgentUsage) => void }) {
+              calls++;
+              options.onUsage?.({ input: 50, output: 0, total: 50, cost: 0, cacheRead: 0, cacheWrite: 0 });
+              return "";
+            },
+          },
+          onAgentEnd: (event) => {
+            ended = event;
+          },
+          persistLogs: false,
+        },
+      ),
+    (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED,
+  );
+  assert.equal(calls, 1, "the retry must be rejected before another provider attempt starts");
+  assert.equal(ended?.errorCode, WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED);
+  assert.equal(ended?.tokens, 50, "the terminal logical-agent event retains the failed attempt usage");
+});
+
+test("parallel sibling nested workflows are allowed while grandchildren remain rejected", async () => {
+  const workflows: Record<string, string> = {
+    left: `export const meta = { name: 'left', description: 'left' }
+return await agent('left', { label: 'left' })`,
+    right: `export const meta = { name: 'right', description: 'right' }
+return await agent('right', { label: 'right' })`,
+    grandchild: `export const meta = { name: 'grandchild', description: 'grandchild' }
+return await agent('grandchild', { label: 'grandchild' })`,
+    childWithGrandchild: `export const meta = { name: 'child', description: 'child' }
+return await workflow('grandchild')`,
+  };
+  const siblingResult = await runWorkflow<unknown[]>(
+    `export const meta = { name: 'siblings', description: 'siblings' }
+return await Promise.all([workflow('left'), workflow('right')])`,
+    {
+      agent: countingAgent().runner,
+      loadSavedWorkflow: (name) => workflows[name],
+      persistLogs: false,
+    },
+  );
+  assert.deepEqual([...siblingResult.result], ["ran:left", "ran:right"]);
+
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'parent', description: 'parent' }
+return await workflow('childWithGrandchild')`,
+        {
+          agent: countingAgent().runner,
+          loadSavedWorkflow: (name) => workflows[name],
+          persistLogs: false,
+        },
+      ),
+    /one level deep/,
+  );
+});
+
+test("hierarchical journal keys replay nested results without collisions or live charges", async () => {
+  const child = `export const meta = { name: 'child', description: 'child' }
+return await agent('child-work', { label: 'child' })`;
+  const parent = `export const meta = { name: 'parent', description: 'parent' }
+const [a, b] = await Promise.all([workflow('child', undefined, { key: 'a' }), workflow('child', undefined, { key: 'b' })])
+return { a, b }`;
+  const firstAgent = countingAgent();
+  const journal: JournalEntry[] = [];
+  const first = await runWorkflow(parent, {
+    agent: firstAgent.runner,
+    loadSavedWorkflow: () => child,
+    onAgentJournal: (entry) => journal.push(entry),
+    persistLogs: false,
+  });
+
+  const keys = journal.map((entry) => entry.key);
+  assert.ok(keys.every(Boolean), "new journals must use stable string keys");
+  assert.equal(new Set(keys).size, keys.length, "parent, siblings, and child calls must not collide");
+
+  const secondAgent = countingAgent();
+  const resumed = await runWorkflow(parent, {
+    agent: secondAgent.runner,
+    loadSavedWorkflow: () => child,
+    resumeJournal: new Map(journal.map((entry) => [entry.key as string, entry])),
+    runtimeCheckpoint: first.runtimeCheckpoint,
+    persistLogs: false,
+  });
+
+  assert.equal(secondAgent.state.calls, 0, "nested results replay without running child agents");
+  assert.equal(resumed.tokenUsage?.total, first.tokenUsage?.total, "journal replay is not charged as live work");
+  assert.ok((resumed.tokenUsage?.accounting.journalReplay ?? 0) > 0, "replay telemetry remains visible");
+});
+
+test("a partially replayed nested child journals its full sibling-safe aggregate", async () => {
+  const parent = `export const meta = { name: 'parent', description: 'parent' }
+return await workflow('child')`;
+  const childV1 = `export const meta = { name: 'child', description: 'child' }
+const first = await agent('first', { label: 'first' })
+const second = await agent('second-v1', { label: 'second' })
+return { first, second }`;
+  const childV2 = childV1.replace("second-v1", "second-v2");
+  const firstJournal: JournalEntry[] = [];
+  const first = await runWorkflow(parent, {
+    agent: fakeAgent({ input: 10, total: 10 }),
+    loadSavedWorkflow: () => childV1,
+    onAgentJournal: (entry) => firstJournal.push(entry),
+    persistLogs: false,
+  });
+
+  let liveCalls = 0;
+  const resumedJournal: JournalEntry[] = [];
+  await runWorkflow(parent, {
+    agent: {
+      async run(_prompt: string, options: { onUsage?: (usage: AgentUsage) => void }) {
+        liveCalls++;
+        options.onUsage?.({ input: 10, output: 0, total: 10, cost: 0, cacheRead: 0, cacheWrite: 0 });
+        return "updated";
+      },
+    },
+    loadSavedWorkflow: () => childV2,
+    resumeJournal: new Map(firstJournal.map((entry) => [entry.key as string, entry])),
+    runtimeCheckpoint: first.runtimeCheckpoint,
+    onAgentJournal: (entry) => resumedJournal.push(entry),
+    persistLogs: false,
+  });
+
+  assert.equal(liveCalls, 1, "the unchanged child prefix replays while the changed sibling runs live");
+  const childAggregate = resumedJournal.find((entry) => entry.key === "root/call:0" && entry.kind === "workflow");
+  assert.equal(childAggregate?.tokens, 30, "the parent journal preserves prior usage and adds only new live usage");
+  assert.equal(childAggregate?.agentCount, 2, "the parent journal preserves the full child agent count");
+});
+
+test("phase charges and cumulative spend survive resume without phase() rebasing", async () => {
+  const journal: JournalEntry[] = [];
+  let checkpoint: RuntimeCheckpoint | undefined;
+  const first = await runWorkflow(
+    `export const meta = { name: 'phase_first', description: 'phase first' }
+phase('bounded', { budget: 100 })
+return await agent('first', { label: 'first' })`,
+    {
+      agent: fakeAgent({ input: 80, total: 80 }),
+      tokenBudget: 200,
+      onAgentJournal: (entry) => journal.push(entry),
+      onRuntimeCheckpoint: (value) => {
+        checkpoint = value;
+      },
+      persistLogs: false,
+    },
+  );
+  assert.equal(first.tokenUsage?.total, 80);
+  assert.ok(checkpoint);
+
+  let liveCalls = 0;
+  let finalCheckpoint: RuntimeCheckpoint | undefined;
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'phase_first', description: 'phase first' }
+phase('bounded', { budget: 100 })
+await agent('first', { label: 'first' })
+await agent('second', { label: 'second' })
+try { await agent('third', { label: 'third' }) } catch {}
+return 'caught'`,
+        {
+          agent: {
+            async run(_prompt: string, options: { onUsage?: (usage: AgentUsage) => void }) {
+              liveCalls++;
+              options.onUsage?.({ input: 30, output: 0, total: 30, cost: 0, cacheRead: 0, cacheWrite: 0 });
+              return "ok";
+            },
+          },
+          tokenBudget: 200,
+          runtimeCheckpoint: checkpoint,
+          resumeJournal: new Map(journal.map((entry) => [entry.key as string, entry])),
+          onRuntimeCheckpoint: (value) => {
+            finalCheckpoint = value;
+          },
+          persistLogs: false,
+        },
+      ),
+    (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED,
+  );
+
+  assert.equal(liveCalls, 1, "the restored phase charge blocks the third call");
+  assert.equal(
+    finalCheckpoint?.usage.total,
+    110,
+    "cumulative logical-run spend includes pre-resume usage exactly once",
+  );
+  assert.equal(
+    Object.values(finalCheckpoint?.phaseBudgets ?? {}).find((phaseBudget) => phaseBudget.title === "bounded")?.charged,
+    110,
+  );
+});
+
+test("live usage exhaustion aborts registered attempts and reports actual overshoot", async () => {
+  let started = 0;
+  const bothStarted = createDeferred<void>();
+  const script = `export const meta = { name: 'live_budget', description: 'live budget' }
+return await parallel([0, 1].map((i) => () => agent('work-' + i, { label: 'a' + i })))`;
+
+  await assert.rejects(
+    () =>
+      runWorkflow(script, {
+        concurrency: 2,
+        tokenBudget: 100,
+        agent: {
+          async run(
+            _prompt: string,
+            options: {
+              signal?: AbortSignal;
+              onUsageUpdate?: (usage: AgentUsage) => void;
+              onUsage?: (usage: AgentUsage) => void;
+            },
+          ) {
+            started++;
+            if (started === 2) bothStarted.resolve();
+            await bothStarted.promise;
+            const usage = { input: 60, output: 0, total: 60, cost: 0, cacheRead: 0, cacheWrite: 0 };
+            options.onUsageUpdate?.(usage);
+            await new Promise<void>((resolve) => {
+              const fallback = setTimeout(resolve, 25);
+              const finish = () => {
+                clearTimeout(fallback);
+                resolve();
+              };
+              if (options.signal?.aborted) finish();
+              else options.signal?.addEventListener("abort", finish, { once: true });
+            });
+            options.onUsage?.(usage);
+            throw new Error("aborted after budget exhaustion");
+          },
+        },
+        persistLogs: false,
+      }),
+    (error: unknown) => {
+      const workflowError = error as WorkflowError & { usage?: { total: number }; overshoot?: number };
+      assert.equal(workflowError.code, WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED);
+      assert.equal(workflowError.usage?.total, 120);
+      assert.equal(workflowError.overshoot, 20);
+      return true;
+    },
+  );
 });
