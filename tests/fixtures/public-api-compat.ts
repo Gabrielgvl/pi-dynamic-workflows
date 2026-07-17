@@ -1,4 +1,10 @@
-import type { ManagedRun, NestedWorkflowOptions, SharedRuntime, WorkflowRunResult } from "../../src/index.js";
+import type {
+  ManagedRun,
+  NestedWorkflowOptions,
+  SharedRuntime,
+  WorkflowRunResult,
+  WorkflowToolInput,
+} from "../../src/index.js";
 
 const runtime: SharedRuntime = {
   limiter: async <T>(fn: () => Promise<T>) => fn(),
@@ -51,7 +57,18 @@ const historicalManagedRun: ManagedRun = {
 };
 
 const nestedOptions: NestedWorkflowOptions = { key: "stable-child" };
+const inlineWorkflowInput: WorkflowToolInput = { script: "return await agent('work')" };
+const pathWorkflowInput: WorkflowToolInput = { scriptPath: "workflows/audit.js", background: false };
 const spent: number = runtime.spent;
 const depth: number = runtime.depth;
 const total: number = runtime.tokenUsage.total;
-void [historicalResult, historicalManagedRun, nestedOptions, spent, depth, total];
+void [
+  historicalResult,
+  historicalManagedRun,
+  nestedOptions,
+  inlineWorkflowInput,
+  pathWorkflowInput,
+  spent,
+  depth,
+  total,
+];

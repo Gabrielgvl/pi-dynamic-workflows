@@ -1,12 +1,33 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+  appendFileSync,
+  chmodSync,
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  mkdtempSync,
+  openSync,
+  readSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  truncateSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager, WorkflowManagerRegistry } from "../src/workflow-manager.js";
-import { backgroundStartedText, createWorkflowTool, modelRoutingGuideline } from "../src/workflow-tool.js";
+import {
+  backgroundStartedText,
+  createWorkflowTool,
+  modelRoutingGuideline,
+  readWorkflowScriptPath,
+  WORKFLOW_SCRIPT_MAX_BYTES,
+} from "../src/workflow-tool.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 /** Minimal fake ModelRegistry, matching the shape the PR's existing tests use. */
@@ -203,17 +224,34 @@ test("createWorkflowTool prepareArguments strips javascript fences", () => {
   }
 });
 
-test("createWorkflowTool exposes optional action, cwd, and runId without requiring script in the schema", () => {
+test("createWorkflowTool exposes both optional run source fields in the schema", () => {
   const tool = createWorkflowTool();
   const parameters = tool.parameters as {
-    properties?: Record<string, { anyOf?: unknown[] }>;
+    properties?: Record<string, { anyOf?: unknown[]; description?: string }>;
     required?: string[];
   };
 
   assert.ok(parameters.properties?.action);
   assert.ok(parameters.properties?.cwd);
   assert.ok(parameters.properties?.runId);
+  assert.ok(parameters.properties?.script);
+  assert.ok(parameters.properties?.scriptPath);
   assert.equal(parameters.required?.includes("script") ?? false, false);
+  assert.equal(parameters.required?.includes("scriptPath") ?? false, false);
+  assert.match(parameters.properties?.script?.description ?? "", /exactly one.*script.*scriptPath/i);
+  assert.match(parameters.properties?.scriptPath?.description ?? "", /canonical.*cwd/i);
+  assert.match(parameters.properties?.scriptPath?.description ?? "", /freshly read|each invocation/i);
+  assert.match(parameters.properties?.scriptPath?.description ?? "", /1 MiB|1048576 bytes/i);
+  assert.match(parameters.properties?.scriptPath?.description ?? "", /final symlinks?.*followed/i);
+});
+
+test("createWorkflowTool guidance explains script and scriptPath source selection", () => {
+  const tool = createWorkflowTool();
+  assert.match(tool.description, /scriptPath/);
+  assert.match(tool.promptSnippet ?? "", /scriptPath/);
+  assert.match(tool.promptGuidelines.join(" "), /exactly one.*script.*scriptPath/i);
+  const parameters = tool.parameters as { properties?: Record<string, { description?: string }> };
+  assert.match(parameters.properties?.resumeFromRunId?.description ?? "", /scriptPath/);
 });
 
 test("createWorkflowTool prepareArguments keeps omitted action as a legacy run", () => {
@@ -225,17 +263,34 @@ test("createWorkflowTool prepareArguments keeps omitted action as a legacy run",
   assert.equal(result.script, "const x = 1");
 });
 
+test("createWorkflowTool prepareArguments requires exactly one run source by property presence", () => {
+  const tool = createWorkflowTool();
+  const prepare = tool.prepareArguments as (args: unknown) => { script?: string; scriptPath?: string };
+
+  assert.deepEqual(prepare({ script: " return 1 " }), { script: "return 1" });
+  assert.deepEqual(prepare({ scriptPath: " workflows/a.js " }), { scriptPath: "workflows/a.js" });
+  assert.deepEqual(prepare({ script: "" }), { script: "" }, "an empty inline script is still a present source");
+  assert.throws(() => prepare({ action: "run" }), /exactly one.*script.*scriptPath/i);
+  assert.throws(() => prepare({ script: "return 1", scriptPath: "workflow.js" }), /exactly one.*script.*scriptPath/i);
+  assert.throws(() => prepare({ script: undefined, scriptPath: "workflow.js" }), /exactly one.*script.*scriptPath/i);
+  assert.throws(() => prepare({ scriptPath: "   " }), /scriptPath.*non-empty/i);
+  assert.throws(() => prepare({ scriptPath: 123 }), /scriptPath.*string/i);
+  assert.throws(() => prepare({ script: undefined }), /script.*string/i);
+});
+
 test("createWorkflowTool prepareArguments validates action-specific field combinations strictly", () => {
   const tool = createWorkflowTool();
   const prepare = tool.prepareArguments as (args: unknown) => unknown;
 
-  assert.throws(() => prepare({ action: "run" }), /script.*required/i);
   assert.throws(() => prepare({ action: "status", script: "return 1" }), /status.*script/i);
+  assert.throws(() => prepare({ action: "status", scriptPath: "workflow.js" }), /status.*scriptPath/i);
   assert.throws(() => prepare({ action: "status", background: true }), /status.*background/i);
   assert.throws(() => prepare({ action: "resume" }), /resume.*runId/i);
   assert.throws(() => prepare({ action: "resume", runId: "r1", args: {} }), /resume.*args/i);
+  assert.throws(() => prepare({ action: "resume", runId: "r1", scriptPath: "workflow.js" }), /resume.*scriptPath/i);
   assert.throws(() => prepare({ action: "resume", runId: "r1", resumeFromRunId: "r0" }), /resume.*resumeFromRunId/i);
   assert.throws(() => prepare({ action: "stop" }), /stop.*runId/i);
+  assert.throws(() => prepare({ action: "stop", runId: "r1", scriptPath: "workflow.js" }), /stop.*scriptPath/i);
   assert.throws(() => prepare({ action: "stop", runId: "r1", tokenBudget: 10 }), /stop.*tokenBudget/i);
   assert.throws(() => prepare({ action: "invalid", runId: "r1" }), /action/i);
   assert.throws(() => prepare({ action: "status", runId: "../other-project" }), /path-safe/i);
@@ -247,7 +302,7 @@ test("createWorkflowTool canonicalizes an explicit cwd during argument preparati
   const cwd = mkdtempSync(join(tmpdir(), "pi-dw-tool-cwd-"));
   const link = `${cwd}-link`;
   try {
-    symlinkSync(cwd, link, "dir");
+    symlinkSync(cwd, link, process.platform === "win32" ? "junction" : "dir");
     const tool = createWorkflowTool({ cwd });
     const prepare = tool.prepareArguments as (args: unknown) => { action: string; cwd: string; runId: string };
     const result = prepare({ action: "status", cwd: link, runId: "r1" });
@@ -381,6 +436,323 @@ return await agent('work', { label: 'worker' })`,
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test(
+  "workflow tool: scriptPath resolves from canonical selected cwd with foreground/background parity and fresh reads",
+  withToolTempCwd(async (cwd) => {
+    const link = `${cwd}-link`;
+    const scriptPath = join(cwd, "workflow.js");
+    symlinkSync(cwd, link, process.platform === "win32" ? "junction" : "dir");
+    try {
+      const manager = new WorkflowManager({ cwd, agent: toolFakeAgent() });
+      const registry = new WorkflowManagerRegistry({ defaultCwd: cwd, defaultManager: manager });
+      const tool = createWorkflowTool({ cwd, managerRegistry: registry });
+      const source = (marker: string) => `export const meta = { name: 'path_run', description: 'path run' }
+const value = await agent('${marker}', { label: 'worker' })
+return { value, marker: '${marker}', cwd }`;
+
+      writeFileSync(scriptPath, source("FIRST"));
+      const foreground = await tool.execute(
+        "path-foreground",
+        { cwd: link, scriptPath: "workflow.js", background: false },
+        undefined,
+        () => {},
+        {},
+      );
+      assert.equal(foreground.details.cwd, cwd);
+      assert.equal(foreground.details.result.value, "ok");
+      assert.equal(foreground.details.result.marker, "FIRST");
+      assert.equal(foreground.details.result.cwd, cwd);
+
+      writeFileSync(scriptPath, source("SECOND"));
+      const background = await tool.execute(
+        "path-background",
+        { cwd: link, scriptPath: "workflow.js" },
+        undefined,
+        () => {},
+        {},
+      );
+      const runId = background.details.runId as string;
+      for (let attempt = 0; attempt < 50 && manager.getRun(runId)?.status === "running"; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const completed = manager.getRun(runId);
+      assert.equal(completed?.status, "completed");
+      assert.equal(completed?.result?.result?.value, "ok");
+      assert.equal(completed?.result?.result?.marker, "SECOND");
+      assert.equal(completed?.result?.result?.cwd, cwd);
+    } finally {
+      rmSync(link, { force: true });
+    }
+  }),
+);
+
+test(
+  "workflow tool: scriptPath reports actionable host filesystem errors",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent() });
+    const tool = createWorkflowTool({ cwd, manager });
+
+    await assert.rejects(
+      () => tool.execute("missing", { scriptPath: "missing.js" }, undefined, undefined, undefined),
+      /scriptPath.*missing\.js.*not found.*resolved/i,
+    );
+    await assert.rejects(
+      () => tool.execute("directory", { scriptPath: "." }, undefined, undefined, undefined),
+      /scriptPath.*directory.*regular file/i,
+    );
+
+    if (process.platform !== "win32") {
+      const unreadable = join(cwd, "unreadable.js");
+      writeFileSync(unreadable, resumeToolScript);
+      chmodSync(unreadable, 0);
+      if (typeof process.getuid !== "function" || process.getuid() !== 0) {
+        await assert.rejects(
+          () => tool.execute("unreadable", { scriptPath: "unreadable.js" }, undefined, undefined, undefined),
+          /scriptPath.*unreadable\.js.*not readable|permission denied/i,
+        );
+      }
+      chmodSync(unreadable, 0o600);
+    }
+
+    if (process.platform !== "win32") {
+      const fifo = join(cwd, "workflow.fifo");
+      execFileSync("mkfifo", [fifo]);
+      await assert.rejects(
+        () => tool.execute("non-regular", { scriptPath: "workflow.fifo" }, undefined, undefined, undefined),
+        /scriptPath.*workflow\.fifo.*not a regular file.*fifo/i,
+      );
+    }
+  }),
+);
+
+test(
+  "workflow tool: scriptPath accepts the exact source byte limit and rejects limit plus one",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent() });
+    const tool = createWorkflowTool({ cwd, manager });
+    const scriptPath = join(cwd, "bounded-workflow.js");
+    const source = `export const meta = { name: 'bounded_path', description: 'bounded path' }
+return await agent('work', { label: 'worker' })`;
+    const paddingBytes = WORKFLOW_SCRIPT_MAX_BYTES - Buffer.byteLength(source);
+    assert.ok(paddingBytes > 0);
+
+    writeFileSync(scriptPath, `${source}${" ".repeat(paddingBytes)}`);
+    const exact = await tool.execute(
+      "exact-limit",
+      { scriptPath: "bounded-workflow.js", background: false },
+      undefined,
+      () => {},
+      {},
+    );
+    assert.equal(exact.details.result, "ok");
+
+    appendFileSync(scriptPath, " ");
+    await assert.rejects(
+      () => tool.execute("over-limit", { scriptPath: "bounded-workflow.js" }, undefined, undefined, undefined),
+      /scriptPath.*exceeds.*1 MiB.*1048576 bytes/i,
+    );
+  }),
+);
+
+test(
+  "readWorkflowScriptPath opens once with readonly nonblocking flags where supported",
+  withToolTempCwd(async (cwd) => {
+    const scriptPath = join(cwd, "flags-workflow.js");
+    writeFileSync(scriptPath, "ORIGINAL");
+    let opened = 0;
+    let closed = 0;
+
+    const source = readWorkflowScriptPath("flags-workflow.js", cwd, {
+      openSync(path, flags) {
+        opened++;
+        const nonblocking = (fsConstants as { O_NONBLOCK?: number }).O_NONBLOCK ?? 0;
+        assert.equal(path, scriptPath);
+        assert.equal(flags, fsConstants.O_RDONLY | nonblocking);
+        return openSync(path, fsConstants.O_RDONLY);
+      },
+      fstatSync,
+      readSync,
+      closeSync(fd) {
+        closed++;
+        closeSync(fd);
+      },
+    });
+
+    assert.equal(source, "ORIGINAL");
+    assert.equal(opened, 1);
+    assert.equal(closed, 1);
+  }),
+);
+
+test(
+  "readWorkflowScriptPath rejects a regular file that grows beyond the limit between read iterations and closes it",
+  { skip: process.platform === "win32" },
+  withToolTempCwd(async (cwd) => {
+    const scriptPath = join(cwd, "growing-workflow.js");
+    writeFileSync(scriptPath, Buffer.alloc(WORKFLOW_SCRIPT_MAX_BYTES, 0x20));
+    let opened = 0;
+    let closed = 0;
+    let reads = 0;
+
+    assert.throws(
+      () =>
+        readWorkflowScriptPath("growing-workflow.js", cwd, {
+          openSync(path, flags) {
+            opened++;
+            return openSync(path, flags);
+          },
+          fstatSync,
+          readSync(fd, buffer, offset, length, position) {
+            reads++;
+            const count = readSync(fd, buffer, offset, Math.min(length, 4096), position);
+            if (reads === 1) appendFileSync(scriptPath, "x");
+            return count;
+          },
+          closeSync(fd) {
+            closed++;
+            closeSync(fd);
+          },
+        }),
+      /scriptPath.*exceeds.*1 MiB.*1048576 bytes/i,
+    );
+    assert.ok(reads >= 2, "the append must occur between loader read iterations");
+    assert.equal(opened, 1);
+    assert.equal(closed, 1);
+  }),
+);
+
+test("readWorkflowScriptPath maps injected permission errors without platform-specific chmod", () => {
+  for (const code of ["EACCES", "EPERM"]) {
+    assert.throws(
+      () =>
+        readWorkflowScriptPath("unreadable.js", "/workflows", {
+          openSync() {
+            throw Object.assign(new Error(code), { code });
+          },
+          fstatSync,
+          readSync,
+          closeSync,
+        }),
+      /scriptPath.*unreadable\.js.*not readable.*permission denied/i,
+    );
+  }
+});
+
+test(
+  "readWorkflowScriptPath rejects truncation after fstat and closes the descriptor",
+  { skip: process.platform === "win32" },
+  withToolTempCwd(async (cwd) => {
+    const scriptPath = join(cwd, "truncated-workflow.js");
+    const retainedSource = `export const meta = { name: 'truncated_path', description: 'truncated path' }
+return 'still-valid'`;
+    writeFileSync(scriptPath, `${retainedSource}\n// removed after fstat`);
+    let closed = 0;
+
+    assert.throws(
+      () =>
+        readWorkflowScriptPath("truncated-workflow.js", cwd, {
+          openSync,
+          fstatSync(fd) {
+            const stats = fstatSync(fd);
+            truncateSync(scriptPath, Buffer.byteLength(retainedSource));
+            return stats;
+          },
+          readSync,
+          closeSync(fd) {
+            closed++;
+            closeSync(fd);
+          },
+        }),
+      /scriptPath.*changed while reading.*retry/i,
+    );
+    assert.equal(closed, 1);
+  }),
+);
+
+test(
+  "readWorkflowScriptPath rejects growth after EOF before final descriptor validation",
+  { skip: process.platform === "win32" },
+  withToolTempCwd(async (cwd) => {
+    const scriptPath = join(cwd, "post-eof-growth-workflow.js");
+    writeFileSync(scriptPath, "ORIGINAL");
+    let inspections = 0;
+    let closed = 0;
+
+    assert.throws(
+      () =>
+        readWorkflowScriptPath("post-eof-growth-workflow.js", cwd, {
+          openSync,
+          fstatSync(fd) {
+            inspections++;
+            if (inspections === 2) appendFileSync(scriptPath, "-CHANGED");
+            return fstatSync(fd);
+          },
+          readSync,
+          closeSync(fd) {
+            closed++;
+            closeSync(fd);
+          },
+        }),
+      /scriptPath.*changed while reading.*retry/i,
+    );
+    assert.equal(inspections, 2);
+    assert.equal(closed, 1);
+  }),
+);
+
+test(
+  "readWorkflowScriptPath keeps reading the opened object when the pathname is replaced",
+  { skip: process.platform === "win32" },
+  withToolTempCwd(async (cwd) => {
+    const scriptPath = join(cwd, "replaceable-workflow.js");
+    const replacementPath = join(cwd, "replacement-workflow.js");
+    writeFileSync(scriptPath, "ORIGINAL");
+    writeFileSync(replacementPath, "REPLACEMENT");
+    let opened = 0;
+
+    const source = readWorkflowScriptPath("replaceable-workflow.js", cwd, {
+      openSync(path, flags) {
+        opened++;
+        const fd = openSync(path, flags);
+        renameSync(replacementPath, scriptPath);
+        return fd;
+      },
+      fstatSync,
+      readSync,
+      closeSync,
+    });
+
+    assert.equal(source, "ORIGINAL");
+    assert.equal(opened, 1);
+  }),
+);
+
+test(
+  "workflow tool: scriptPath follows a final symlink to a regular file",
+  { skip: process.platform === "win32" },
+  withToolTempCwd(async (cwd) => {
+    const targetPath = join(cwd, "target-workflow.js");
+    const linkPath = join(cwd, "linked-workflow.js");
+    writeFileSync(
+      targetPath,
+      `export const meta = { name: 'symlink_path', description: 'symlink path' }
+return await agent('linked', { label: 'worker' })`,
+    );
+    symlinkSync(targetPath, linkPath);
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("linked-ok") });
+    const tool = createWorkflowTool({ cwd, manager });
+
+    const result = await tool.execute(
+      "final-symlink",
+      { scriptPath: "linked-workflow.js", background: false },
+      undefined,
+      () => {},
+      {},
+    );
+    assert.equal(result.details.result, "linked-ok");
+  }),
+);
 
 test("createWorkflowTool prepareArguments passes through args", () => {
   const tool = createWorkflowTool();
@@ -531,7 +903,7 @@ test(
 );
 
 test(
-  "workflow tool: resumeFromRunId resumes a paused run with the edited script",
+  "workflow tool: resumeFromRunId accepts scriptPath as the freshly read edited source",
   withToolTempCwd(async (cwd) => {
     const seen: string[] = [];
     let failSecond = true;
@@ -567,8 +939,16 @@ return { a, b }`;
 const a = await agent('FIRST', { label: 'first' })
 const b = await agent('SECOND-EDITED', { label: 'second' })
 return { a, b }`;
+    const editedPath = join(cwd, "edited-workflow.js");
+    writeFileSync(editedPath, v2);
     const seenBefore = seen.length;
-    const res = await tool.execute("t5", { script: v2, resumeFromRunId: runId }, undefined, undefined, undefined);
+    const res = await tool.execute(
+      "t5",
+      { scriptPath: "edited-workflow.js", resumeFromRunId: runId },
+      undefined,
+      undefined,
+      undefined,
+    );
     const details = res.details as { runId?: string; resumedFrom?: string };
     assert.equal(details.runId, runId, "resumed run keeps the same run id");
     assert.equal(details.resumedFrom, runId);

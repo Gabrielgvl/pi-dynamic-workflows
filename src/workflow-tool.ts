@@ -1,3 +1,5 @@
+import { closeSync, constants as fsConstants, fstatSync, openSync, readSync, type Stats } from "node:fs";
+import { resolve } from "node:path";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -20,6 +22,19 @@ import { WorkflowManager, WorkflowManagerRegistry } from "./workflow-manager.js"
 import { canonicalWorkflowCwd } from "./workflow-paths.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
 import { loadWorkflowSettings } from "./workflow-settings.js";
+
+/** Maximum UTF-8 source bytes accepted from scriptPath (1 MiB). */
+export const WORKFLOW_SCRIPT_MAX_BYTES = 1024 * 1024;
+
+/** @internal Injectable descriptor operations used by deterministic filesystem race tests. */
+export interface WorkflowScriptFileOps {
+  openSync(path: string, flags: number): number;
+  fstatSync(fd: number): Stats;
+  readSync(fd: number, buffer: Buffer, offset: number, length: number, position: number | null): number;
+  closeSync(fd: number): void;
+}
+
+const workflowScriptFileOps: WorkflowScriptFileOps = { openSync, fstatSync, readSync, closeSync };
 
 /**
  * Model routing guideline for workflow authors.
@@ -75,11 +90,16 @@ const workflowToolSchema = Type.Object({
   script: Type.Optional(
     Type.String({
       description: [
-        "Required for run actions: raw JavaScript workflow script, with no Markdown fences.",
-        "First statement: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{ title: 'Phase' }] }",
-        "Use phase('Name'), agent(prompt, opts), parallel(arrayOfFunctions), pipeline(items, ...stages), log(message), args, and budget. The workflow must call agent() at least once.",
-        "parallel() requires functions, not promises: await parallel(items.map(item => () => agent(...))).",
+        "Run source: provide exactly one of `script` or `scriptPath`. Raw JavaScript only; no Markdown fences.",
+        "First statement must export const meta = { name: 'short_name', description: 'non-empty', phases: [{ title: 'Phase' }] }.",
+        "The workflow must call agent() at least once. Pass functions, not promises, to parallel().",
       ].join(" "),
+    }),
+  ),
+  scriptPath: Type.Optional(
+    Type.String({
+      description:
+        "Run source: provide exactly one of `script` or `scriptPath`. Non-empty host regular-file path, relative to canonical cwd and freshly read each invocation. Maximum source size is 1 MiB (1048576 bytes). Final symlinks are followed to preserve host-accessible path behavior; the opened target must be a regular file.",
     }),
   ),
   args: Type.Optional(
@@ -121,11 +141,8 @@ const workflowToolSchema = Type.Object({
   ),
   resumeFromRunId: Type.Optional(
     Type.String({
-      description: [
-        "Resume a prior run (this ID) with an edited `script` instead of starting a new run.",
-        "Unchanged agent() calls replay from that run's cache; the first changed/new call onward re-runs.",
-        "Calls match by position: keep earlier good calls identical and in order. Always background.",
-      ].join(" "),
+      description:
+        "Resume this run ID with edited `script` or `scriptPath`. Positional unchanged calls replay from cache; changed/new calls re-run. Always background.",
     }),
   ),
 });
@@ -137,6 +154,7 @@ export type WorkflowToolInput = {
   cwd?: string;
   runId?: string;
   script?: string;
+  scriptPath?: string;
   args?: unknown;
   background?: boolean;
   maxAgents?: number;
@@ -191,18 +209,16 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
   return defineTool({
     name: "workflow",
     label: "Workflow",
-    description: [
-      "Run or control deterministic JavaScript workflows that orchestrate multiple subagents.",
-      "Omit action (or use action='run') with a script to start a run; use status, resume, or stop with the documented control fields.",
-    ].join(" "),
+    description:
+      "Run or control deterministic JavaScript subagent workflows. Run with exactly one source: `script` or `scriptPath`; use status, resume, or stop for control.",
     promptSnippet:
-      "Run or control a deterministic JavaScript workflow. Run scripts require: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{ title: 'Phase' }] }.",
+      "Run or control a deterministic JavaScript workflow. Runs require exactly one of `script` or `scriptPath`; the source must begin with: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{ title: 'Phase' }] }.",
     // Lazy accessor: the SDK re-reads definition.promptGuidelines on every
     // tool-registry refresh, so changes to the agentType registry are reflected.
     get promptGuidelines() {
       return [
         "Use workflow only when the user explicitly asks for a workflow, workflows, fan-out, or multi-agent orchestration.",
-        "For workflow, always pass one raw JavaScript string in the required script parameter; do not include Markdown fences or prose around the script.",
+        "For workflow runs, pass exactly one of inline `script` or host-file `scriptPath`. Relative scriptPath resolves from canonical cwd, is freshly read, follows final symlinks to regular files, and is limited to 1 MiB.",
         "For workflow, the script's first statement must be `export const meta = { name: 'short_snake_case', description: 'non-empty human description', phases: [{ title: 'Phase name' }] }`; meta.name and meta.description are required non-empty strings.",
         "For workflow, write plain JavaScript after the meta export. Do not use TypeScript syntax, imports, require(), fs, Date.now(), Math.random(), or new Date().",
         "For workflow, available globals are agent(prompt, opts), parallel(thunks), pipeline(items, ...stages), workflow(nameOrScript, args?, { key?: string }), phase(title), log(message), args, cwd, process.cwd(), and budget. Every workflow must call agent() at least once; do not use workflow only to declare phases or return a static object.",
@@ -282,7 +298,9 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         };
       }
 
-      const script = normalizeWorkflowScript(params.script as string);
+      const script = Object.hasOwn(params, "scriptPath")
+        ? readWorkflowScriptPath(params.scriptPath as string, selectedCwd)
+        : normalizeWorkflowScript(params.script as string);
       const parsed = parseWorkflowScript(script);
 
       // Iteration / cached-prefix reuse: resume a prior run with THIS (edited)
@@ -485,7 +503,7 @@ export function backgroundStartedText(name: string, runId: string): string {
  */
 export function reviseHint(runId: string | undefined): string {
   if (!runId) return "";
-  return `To revise without re-running everything: re-call workflow with resumeFromRunId="${runId}" and an edited script — unchanged agent() calls replay from cache, only edited/new ones re-run.`;
+  return `To revise without re-running everything: re-call workflow with resumeFromRunId="${runId}" and edited source in script or scriptPath — unchanged agent() calls replay from cache, only edited/new ones re-run.`;
 }
 
 /**
@@ -494,7 +512,7 @@ export function reviseHint(runId: string | undefined): string {
  */
 export function resumedText(name: string, runId: string): string {
   return [
-    `Workflow "${name}" resumed from run ${runId} with your edited script.`,
+    `Workflow "${name}" resumed from run ${runId} with your edited source.`,
     "Unchanged agent() calls replay from that run's journal (cache); the first",
     "edited or newly inserted agent() call — and everything after it — re-runs live.",
     "It runs in the background; the result is delivered back here when it finishes,",
@@ -534,6 +552,7 @@ const WORKFLOW_TOOL_FIELDS = new Set([
   "cwd",
   "runId",
   "script",
+  "scriptPath",
   "args",
   "background",
   "maxAgents",
@@ -545,6 +564,7 @@ const WORKFLOW_TOOL_FIELDS = new Set([
 ]);
 const RUN_ONLY_FIELDS = [
   "script",
+  "scriptPath",
   "args",
   "background",
   "maxAgents",
@@ -588,8 +608,19 @@ function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {
   }
 
   if (action === "run") {
-    if (typeof value.script !== "string") {
-      throw new Error("workflow run: `script` is required and must be a string");
+    const hasScript = Object.hasOwn(value, "script");
+    const hasScriptPath = Object.hasOwn(value, "scriptPath");
+    if (hasScript === hasScriptPath) {
+      throw new Error("workflow run requires exactly one of `script` or `scriptPath`");
+    }
+    if (hasScript && typeof value.script !== "string") {
+      throw new Error("workflow run: `script` must be a string");
+    }
+    if (hasScriptPath && typeof value.scriptPath !== "string") {
+      throw new Error("workflow run: `scriptPath` must be a string");
+    }
+    if (typeof value.scriptPath === "string" && value.scriptPath.trim().length === 0) {
+      throw new Error("workflow run: `scriptPath` must be a non-empty string");
     }
     if (Object.hasOwn(value, "runId")) throw new Error("workflow run does not accept `runId`");
   } else {
@@ -607,7 +638,143 @@ function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {
     ...(typeof value.runId === "string" ? { runId: value.runId.trim() } : {}),
     ...(typeof value.resumeFromRunId === "string" ? { resumeFromRunId: value.resumeFromRunId.trim() } : {}),
     ...(typeof value.script === "string" ? { script: normalizeWorkflowScript(value.script) } : {}),
+    ...(typeof value.scriptPath === "string" ? { scriptPath: value.scriptPath.trim() } : {}),
   } as WorkflowToolInput;
+}
+
+/**
+ * Loads scriptPath from one descriptor. The final symlink is intentionally
+ * followed at open time; pathname replacement after open cannot change the
+ * object that is validated and read.
+ *
+ * @internal Exported for deterministic descriptor/race tests; not re-exported
+ * from the package root.
+ */
+export function readWorkflowScriptPath(
+  scriptPath: string,
+  cwd: string,
+  fileOps: WorkflowScriptFileOps = workflowScriptFileOps,
+): string {
+  const resolvedPath = resolve(cwd, scriptPath);
+  const nonblocking = (fsConstants as { O_NONBLOCK?: number }).O_NONBLOCK ?? 0;
+  let fd: number;
+  try {
+    fd = fileOps.openSync(resolvedPath, fsConstants.O_RDONLY | nonblocking);
+  } catch (error) {
+    throw scriptPathOpenError(error, scriptPath, resolvedPath);
+  }
+
+  try {
+    let stats: Stats;
+    try {
+      stats = fileOps.fstatSync(fd);
+    } catch (error) {
+      throw new Error(
+        `workflow run: could not inspect scriptPath "${scriptPath}" (resolved path: "${resolvedPath}"): ${errorMessage(error)}`,
+      );
+    }
+
+    if (stats.isDirectory()) {
+      throw new Error(
+        `workflow run: scriptPath "${scriptPath}" resolves to directory "${resolvedPath}"; expected a regular file`,
+      );
+    }
+    if (!stats.isFile()) {
+      throw new Error(
+        `workflow run: scriptPath "${scriptPath}" is not a regular file (${fileType(stats)}) (resolved path: "${resolvedPath}")`,
+      );
+    }
+    if (stats.size > WORKFLOW_SCRIPT_MAX_BYTES) {
+      throw scriptPathTooLargeError(scriptPath, resolvedPath);
+    }
+
+    const source = Buffer.allocUnsafe(WORKFLOW_SCRIPT_MAX_BYTES + 1);
+    let bytesRead = 0;
+    try {
+      while (bytesRead < source.length) {
+        const count = fileOps.readSync(fd, source, bytesRead, source.length - bytesRead, null);
+        if (count === 0) break;
+        bytesRead += count;
+      }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EACCES" || code === "EPERM") {
+        throw new Error(
+          `workflow run: scriptPath "${scriptPath}" is not readable (resolved path: "${resolvedPath}"): permission denied`,
+        );
+      }
+      throw new Error(
+        `workflow run: could not read scriptPath "${scriptPath}" (resolved path: "${resolvedPath}"): ${errorMessage(error)}`,
+      );
+    }
+    if (bytesRead > WORKFLOW_SCRIPT_MAX_BYTES) {
+      throw scriptPathTooLargeError(scriptPath, resolvedPath);
+    }
+
+    let finalStats: Stats;
+    try {
+      finalStats = fileOps.fstatSync(fd);
+    } catch (error) {
+      throw new Error(
+        `workflow run: could not inspect scriptPath "${scriptPath}" (resolved path: "${resolvedPath}"): ${errorMessage(error)}`,
+      );
+    }
+    if (finalStats.size > WORKFLOW_SCRIPT_MAX_BYTES) {
+      throw scriptPathTooLargeError(scriptPath, resolvedPath);
+    }
+    if (bytesRead !== stats.size || finalStats.size !== stats.size) {
+      throw scriptPathChangedError(scriptPath, resolvedPath);
+    }
+
+    return normalizeWorkflowScript(source.toString("utf8", 0, bytesRead));
+  } finally {
+    fileOps.closeSync(fd);
+  }
+}
+
+function scriptPathOpenError(error: unknown, scriptPath: string, resolvedPath: string): Error {
+  const code = (error as NodeJS.ErrnoException).code;
+  if (code === "ENOENT") {
+    return new Error(`workflow run: scriptPath "${scriptPath}" was not found (resolved path: "${resolvedPath}")`);
+  }
+  if (code === "EACCES" || code === "EPERM") {
+    return new Error(
+      `workflow run: scriptPath "${scriptPath}" is not readable (resolved path: "${resolvedPath}"): permission denied`,
+    );
+  }
+  if (code === "EISDIR") {
+    return new Error(
+      `workflow run: scriptPath "${scriptPath}" resolves to directory "${resolvedPath}"; expected a regular file`,
+    );
+  }
+  return new Error(
+    `workflow run: could not inspect scriptPath "${scriptPath}" (resolved path: "${resolvedPath}"): ${errorMessage(error)}`,
+  );
+}
+
+function scriptPathTooLargeError(scriptPath: string, resolvedPath: string): Error {
+  return new Error(
+    `workflow run: scriptPath "${scriptPath}" exceeds maximum source size of 1 MiB (${WORKFLOW_SCRIPT_MAX_BYTES} bytes) (resolved path: "${resolvedPath}")`,
+  );
+}
+
+function scriptPathChangedError(scriptPath: string, resolvedPath: string): Error {
+  return new Error(
+    `workflow run: scriptPath "${scriptPath}" changed while reading (resolved path: "${resolvedPath}"); retry the run`,
+  );
+}
+
+function fileType(stats: Stats): string {
+  if (stats.isFIFO()) return "FIFO";
+  if (stats.isSocket()) return "socket";
+  if (stats.isCharacterDevice()) return "character device";
+  if (stats.isBlockDevice()) return "block device";
+  if (stats.isSymbolicLink()) return "symbolic link";
+  return "non-regular path";
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function normalizeWorkflowScript(script: string): string {

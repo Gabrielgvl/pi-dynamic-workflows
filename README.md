@@ -42,16 +42,20 @@ The original run shape remains valid: omitting `action` is exactly the same as `
 
 | Action | Required | Optional | Rejected |
 | --- | --- | --- | --- |
-| omitted / `"run"` | `script` | `cwd`, `args`, `background`, `maxAgents`, `concurrency`, `agentRetries`, `agentTimeoutMs`, `tokenBudget` | `runId` |
-| `"status"` | — | `cwd`, `runId` | script and all execution options |
-| `"resume"` | `runId` | `cwd` | script and all execution options |
-| `"stop"` | `runId` | `cwd` | script and all execution options |
+| omitted / `"run"` | exactly one of `script` or `scriptPath` | `cwd`, `args`, `background`, `maxAgents`, `concurrency`, `agentRetries`, `agentTimeoutMs`, `tokenBudget`, `resumeFromRunId` | `runId`; whichever source field was not selected |
+| `"status"` | — | `cwd`, `runId` | `script`, `scriptPath`, and all execution options |
+| `"resume"` | `runId` | `cwd` | `script`, `scriptPath`, and all execution options |
+| `"stop"` | `runId` | `cwd` | `script`, `scriptPath`, and all execution options |
 
 ```json
 { "action": "status", "cwd": "/workspace/project", "runId": "audit-abc123" }
 ```
 
 `cwd` may be any existing host-accessible directory. The runtime checks that it exists and is a directory, canonicalizes it with `realpath`, and uses that canonical value for both execution and its isolated persistence namespace. It never calls global `process.chdir()`. Host permission callbacks remain responsible for access policy; there is no extension-owned approved-root allowlist.
+
+`script` supplies inline source. `scriptPath` supplies a non-empty path to a host-accessible regular file of at most **1 MiB (1048576 bytes)**. Relative paths resolve from the canonical selected `cwd`; absolute paths are used directly. Final symlinks are followed, consistent with the existing host-accessible path policy, but the opened target must be a regular file. The runtime opens the path once with nonblocking flags where supported, validates that same descriptor, and performs a bounded read from it, so pathname replacement after open cannot switch the object being loaded. Files whose size changes while being read are rejected, including files that grow beyond the limit. The file is freshly opened on every tool invocation, after cwd selection, so edits made between invocations are observed. Missing, unreadable, oversized, directory, and other non-regular paths fail with an actionable error. This host-side loading does not expose filesystem access inside the workflow VM.
+
+For edited-source iteration, a run action may pair `resumeFromRunId` with either `script` or `scriptPath`; the freshly loaded source is passed to the existing resume path. The control action `action: "resume"` is different: it rejects both source fields and resumes only the source already persisted with the run.
 
 `status` with a run ID returns one redacted metadata record. Without an ID it returns at most 20 recent records from that cwd namespace, including persisted runs from other sessions for recovery. Status omits scripts, arguments, agent prompts/history, logs, journal values, and workflow results, and never scans another cwd namespace.
 
@@ -104,7 +108,7 @@ return await agent(
 
 - **Real parallel orchestration** — fan out up to 16 concurrent and 1000 total subagents from one orchestration script.
 - **Per-agent model routing** — use `small`, `medium`, or `big` tiers, or choose an exact provider/model and thinking level.
-- **Journaled resume** — replay completed agents after interruption without rerunning them or spending their tokens again. The orchestrator can also resume with an **edited script** (`resumeFromRunId`): unchanged `agent()` calls replay from cache and only edited/new ones re-run — so a single bad prompt no longer means paying to re-run the whole workflow.
+- **Journaled resume** — replay completed agents after interruption without rerunning them or spending their tokens again. The orchestrator can also resume with **edited source** from `script` or `scriptPath` (`resumeFromRunId`): unchanged `agent()` calls replay from cache and only edited/new ones re-run — so a single bad prompt no longer means paying to re-run the whole workflow.
 - **Git worktree isolation** — let parallel agents edit safely on throwaway branches with `isolation: "worktree"`.
 - **Measured usage** — report real tokens and cost from each subagent session; add run, phase, or agent budgets only when you want them.
 - **Visible background runs** — track phases, agents, models, fresh/cache tokens, cost, and live tok/s from the progress panel or `/workflows` navigator.
@@ -281,7 +285,7 @@ Duplicate sibling identity is enforced dynamically as each `workflow()` call is 
 
 For larger or flakier fan-outs, the `workflow` tool also accepts `concurrency` (max agents running at once, clamped to the runtime maximum of `16`) and `agentRetries` (retry attempts after a recoverable failure). Both can be defaulted in `~/.pi/workflows/settings.json` as `{ "defaultConcurrency": 4, "defaultAgentRetries": 2 }`; a per-run tool value overrides the default, and a per-agent `retries` overrides `agentRetries`. Retries default to `0` (off) unless configured or passed. Timeouts abort and fully settle before a configured retry; nonrecoverable errors abort the run.
 
-Journal replay — including edit-and-resume via `resumeFromRunId` — matches cached agent results by **positional call index** (the order in which `agent()` calls execute), the same contract Claude Code uses. Editing an `agent()` prompt in place reuses the cache up to that call and re-runs it and everything after. Inserting, removing, or reordering an `agent()` call before others shifts their positions and invalidates the cache from that point on (mismatched calls simply re-run — no crash). To preserve the cached prefix, keep the earlier still-good `agent()` calls unchanged and in the same order.
+Journal replay — including edit-and-resume via `resumeFromRunId` with inline `script` or freshly read `scriptPath` source — matches cached agent results by **positional call index** (the order in which `agent()` calls execute), the same contract Claude Code uses. Editing an `agent()` prompt in place reuses the cache up to that call and re-runs it and everything after. Inserting, removing, or reordering an `agent()` call before others shifts their positions and invalidates the cache from that point on (mismatched calls simply re-run — no crash). To preserve the cached prefix, keep the earlier still-good `agent()` calls unchanged and in the same order.
 
 ## Development
 
