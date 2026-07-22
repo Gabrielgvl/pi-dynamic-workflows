@@ -316,6 +316,74 @@ test("an empty explicit nested key is rejected", async () => {
   );
 });
 
+test("malformed nested workflow options reject before child or agent side effects", async () => {
+  const malformedOptions = [
+    "null",
+    "[]",
+    "'invalid'",
+    "42",
+    "true",
+    "() => {}",
+    "/invalid/",
+    "new Map()",
+    "Object.create({ inherited: true })",
+    "Symbol('invalid')",
+  ];
+
+  for (const expression of malformedOptions) {
+    let workflowLoads = 0;
+    let agentCalls = 0;
+    await assert.rejects(
+      () =>
+        runWorkflow(parentFor(`return await workflow('child', {}, ${expression})`), {
+          loadSavedWorkflow: () => {
+            workflowLoads++;
+            return oneAgentChild;
+          },
+          persistLogs: false,
+          agent: {
+            async run() {
+              agentCalls++;
+              return "unexpected";
+            },
+          },
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof WorkflowError, expression);
+        assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, expression);
+        assert.match(error.message, /third argument must be an options object/i, expression);
+        return true;
+      },
+      expression,
+    );
+    assert.equal(workflowLoads, 0, `${expression} does not resolve the child`);
+    assert.equal(agentCalls, 0, `${expression} does not execute an agent`);
+  }
+});
+
+test("plain nested workflow options are synchronously snapshotted before caller mutation", async () => {
+  let agentCalls = 0;
+  const result = await runWorkflow(
+    parentFor(`const options = { key: 'stable' }
+const pending = workflow('child', {}, options)
+options.key = ''
+return await pending`),
+    {
+      loadSavedWorkflow: () => oneAgentChild,
+      persistLogs: false,
+      agent: {
+        async run() {
+          agentCalls++;
+          return "snapshotted";
+        },
+      },
+    },
+  );
+
+  assert.equal(result.result, "snapshotted");
+  assert.equal(agentCalls, 1);
+});
+
 test("adding an explicit key never adopts an ambiguous legacy implicit occurrence", async () => {
   const implicitIdentity = createHash("sha256")
     .update(JSON.stringify({ workflowIdentity: { savedWorkflow: "child" }, args: { same: true } }))

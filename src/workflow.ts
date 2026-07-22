@@ -17,6 +17,7 @@ import { DEFAULT_AGENT_TIMEOUT_MS, MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CO
 import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
+import { boundWorktreeCleanupFailure, MAX_WORKTREE_CLEANUP_FAILURES } from "./run-persistence.js";
 import { createAgentStoreTools, SharedStore } from "./shared-store.js";
 import {
   type BudgetExhaustion,
@@ -27,7 +28,16 @@ import {
   UsageController,
   type UsageSample,
 } from "./usage.js";
-import { createWorktree, removeWorktree, type Worktree } from "./worktree.js";
+import {
+  DEFAULT_WORKTREE_OPERATIONS,
+  type RetainedWorktreeLease,
+  RetainedWorktreeRegistry,
+  type RetainedWorktreeResult,
+  type Worktree,
+  type WorktreeCleanupFailure,
+  type WorktreeHandle,
+  type WorktreeOperations,
+} from "./worktree.js";
 
 export interface WorkflowMetaPhase {
   title: string;
@@ -103,6 +113,8 @@ export interface SharedRuntime {
   liveInvocations?: Set<Promise<unknown>>;
   /** Internal operations grouped by the invocation that owns their lifetime. */
   liveOperationsByScope?: Map<string, Set<Promise<unknown>>>;
+  /** @deprecated Root-scoped ownership is carried by a separate execution context. */
+  retainedWorktrees?: RetainedWorktreeRegistry;
 }
 
 interface ActiveSharedRuntime extends SharedRuntime {
@@ -110,6 +122,35 @@ interface ActiveSharedRuntime extends SharedRuntime {
   tokenUsage: TokenUsage;
   liveInvocations: Set<Promise<unknown>>;
   liveOperationsByScope: Map<string, Set<Promise<unknown>>>;
+}
+
+interface CleanupFailureCollectionResult {
+  /** Immutable detached value admitted to the canonical bounded root collection. */
+  admittedFailure?: WorktreeCleanupFailure;
+  /** Bounded diagnostic produced when the external callback itself throws. */
+  callbackFailure?: WorktreeCleanupFailure;
+}
+
+interface RootOperationAdmission {
+  readonly owner: symbol;
+}
+
+interface RootExecutionContext {
+  retainedWorktrees: RetainedWorktreeRegistry;
+  admitOperation(parent?: RootOperationAdmission): RootOperationAdmission;
+  completeOperationAdmission(admission: RootOperationAdmission): void;
+  closeOperationAdmission(): void;
+  retainedWorktreeUseScopes: Set<string>;
+  /** Bounded diagnostics accumulated across ordinary, explicit-release, and terminal cleanup. */
+  worktreeCleanupFailures: WorktreeCleanupFailure[];
+  /** Deduplicated root collection plus the single external callback dispatch point. */
+  reportWorktreeCleanupFailure(failure: WorktreeCleanupFailure): CleanupFailureCollectionResult;
+  /** Ordinary failed cleanups whose proof authority ends at root terminal settlement. */
+  terminalProofWorktrees: Set<Worktree>;
+  /** Failed creation rollbacks that receive one root-owned terminal cleanup retry. */
+  terminalRetryWorktrees: Set<Worktree>;
+  /** Operations owned by this root, including nested workflows and retained consumers. */
+  liveOperations: Set<Promise<unknown>>;
 }
 
 export interface WorkflowRunOptions extends WorkflowAgentOptions {
@@ -151,10 +192,18 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   resumeFromRunId?: string;
   /** Called after each live agent completes so the caller can persist the journal. */
   onAgentJournal?: (entry: JournalEntry) => void;
+  /** Internal/injectable worktree operations (primarily for deterministic tests). */
+  worktreeOperations?: WorktreeOperations;
+  /** Receives best-effort retained-worktree cleanup diagnostics. */
+  onWorktreeCleanupFailure?: (failure: WorktreeCleanupFailure) => void | PromiseLike<void>;
   /** Internal: observes entries actually replayed inside a nested invocation. */
   onJournalReplay?: (entry: JournalEntry) => void;
   /** Internal: shared runtime inherited by a nested workflow() call. */
   sharedRuntime?: SharedRuntime;
+  /** Internal: per-root ownership inherited only by nested workflow() calls. */
+  executionContext?: RootExecutionContext;
+  /** Internal: live admission inherited by one already-admitted nested wrapper. */
+  operationAdmission?: RootOperationAdmission;
   /** Internal positional scope for hierarchical journal keys. */
   scopeKey?: string;
   /** Internal stable scope for usage and phase ownership, independent of execution position. */
@@ -251,6 +300,8 @@ export interface WorkflowRunResult<T = unknown> {
   tokenUsage?: WorkflowTokenUsage;
   runtimeCheckpoint?: RuntimeCheckpoint;
   budget?: { limit: number; spent: number; overshoot: number };
+  /** Bounded retained-worktree cleanup failures. Successful cleanup omits this field. */
+  worktreeCleanupFailures?: WorktreeCleanupFailure[];
 }
 
 export interface NestedWorkflowOptions {
@@ -277,6 +328,10 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    */
   tier?: string;
   isolation?: "worktree";
+  /** Keep a newly isolated worktree alive and return `{ result, worktree }`. */
+  retainWorktree?: boolean;
+  /** Bind this agent exclusively to a runtime-issued retained-worktree handle. */
+  worktree?: WorktreeHandle;
   /**
    * Name of a registered subagent definition (`.pi/agents/<name>.md`, project >
    * user). Binds that definition's tool allow/denylist, model, and body prompt
@@ -339,6 +394,35 @@ const DETERMINISM_BLOCKLIST = /\bDate\s*\.\s*now\b|\bMath\s*\.\s*random\b|\bnew\
  * script could bypass this. The guard is best-effort against ACCIDENTAL
  * nondeterminism from trusted (user / guided-LLM) scripts, not a security wall.
  */
+const MAX_WORKTREE_CLEANUP_DIAGNOSTIC_LENGTH = 1024;
+
+function worktreeCleanupDispatchFailure(worktree: Worktree, error: unknown): WorktreeCleanupFailure {
+  return {
+    stage: "cleanup_dispatch",
+    message: (error instanceof Error ? error.message : String(error)).slice(0, MAX_WORKTREE_CLEANUP_DIAGNOSTIC_LENGTH),
+    identity: {
+      repoRoot: worktree.repoRoot ?? "",
+      worktreePath: worktree.cwd,
+      branchRef: worktree.branchRef ?? (worktree.branch ? `refs/heads/${worktree.branch}` : ""),
+      baseSha: worktree.baseSha ?? "",
+    },
+  };
+}
+
+async function disposeWorktreeProofsSafely(
+  operations: WorktreeOperations,
+  worktree: Worktree,
+  reportFailure: (failure: WorktreeCleanupFailure) => void,
+): Promise<void> {
+  try {
+    await Promise.resolve().then(() =>
+      (operations.disposeWorktreeProofs ?? DEFAULT_WORKTREE_OPERATIONS.disposeWorktreeProofs)?.(worktree),
+    );
+  } catch (error) {
+    reportFailure(worktreeCleanupDispatchFailure(worktree, error));
+  }
+}
+
 const DETERMINISM_PRELUDE = [
   '"use strict";',
   'Math.random = () => { throw new Error("Math.random() is unavailable in a workflow (it breaks resume); pass randomness via args or vary by index"); };',
@@ -368,7 +452,7 @@ export async function runWorkflow<T = unknown>(
   const routingConfig = parseModelRoutingFromMeta(meta.phases, meta.model);
   const maxAgents = options.maxAgents ?? MAX_AGENTS_PER_RUN;
   const agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
-  const runId = options.runId ?? `run-${started.toString(36)}`;
+  const runId = options.runId ?? `run-${randomUUID()}`;
   const baseCwd = options.cwd ?? process.cwd();
   // Snapshot the agentType registry ONCE per run so two agent() calls can't
   // observe a mid-run edit (determinism); a later resume re-reads it.
@@ -410,10 +494,17 @@ export async function runWorkflow<T = unknown>(
   const concurrency = normalizeConcurrency(
     options.concurrency ?? Math.max(1, (globalThis.navigator?.hardwareConcurrency ?? 8) - 2),
   );
-  // Global caps + accounting are shared with any nested workflow() so they hold across nesting.
+  const invocationDepth = options.nestingDepth ?? 0;
+  // Global caps + accounting are shared with nested workflow() calls. Retained
+  // capabilities are separately scoped to this root execution context. The call
+  // that creates that context owns terminal cleanup; legacy SharedRuntime.depth
+  // is compatibility data only and never conveys ownership.
   const shared = resolveSharedRuntime(options, concurrency);
+  const ownsExecutionContext = options.executionContext === undefined;
+  const executionContext =
+    options.executionContext ??
+    createRootExecutionContext(options.worktreeOperations, options.onWorktreeCleanupFailure);
   const limiter = shared.limiter;
-  const invocationDepth = options.nestingDepth ?? options.sharedRuntime?.depth ?? 0;
   const nestedImplicitIdentities = new Set<string>();
   const nestedExplicitKeys = new Set<string>();
   let localAgentCount = 0;
@@ -462,17 +553,25 @@ export async function runWorkflow<T = unknown>(
     }
   };
 
-  const agent = async (prompt: string, agentOptions: AgentOptions = {}) => {
-    throwIfAborted();
-
-    // Check agent limit
-    if (shared.agentCount >= maxAgents) {
-      throw new WorkflowError(
-        `Agent limit exceeded (${maxAgents}). Use maxAgents option to increase the limit.`,
-        WorkflowErrorCode.AGENT_LIMIT_EXCEEDED,
-        { recoverable: false },
-      );
+  const reportWorktreeCleanupFailure = (failure: WorktreeCleanupFailure): void => {
+    const collected = executionContext.reportWorktreeCleanupFailure(failure);
+    if (collected.callbackFailure) {
+      logger.error(`worktree cleanup diagnostic callback failed: ${collected.callbackFailure.message}`);
     }
+    if (!collected.admittedFailure) return;
+    try {
+      log(`worktree cleanup failed at ${collected.admittedFailure.stage}: ${collected.admittedFailure.message}`);
+    } catch {
+      // Cleanup observability is best-effort and must never replace the primary outcome.
+    }
+  };
+
+  const runAgent = async (
+    operationAdmission: RootOperationAdmission,
+    prompt: string,
+    agentOptions: Readonly<AgentOptions>,
+  ) => {
+    throwIfAborted();
 
     const assignedPhase = agentOptions.phase ?? state.currentPhase;
     const assignedPhaseKey = assignedPhase
@@ -488,6 +587,15 @@ export async function runWorkflow<T = unknown>(
     if (agentOptions.agentType && !agentDef) {
       log(`unknown agentType "${agentOptions.agentType}"; using default tools/model`);
     }
+    const resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation;
+    if (agentOptions.worktree !== undefined && resolvedIsolation !== undefined) {
+      throw new TypeError("agent({ worktree }) cannot be combined with isolation, including agentType isolation");
+    }
+    if (agentOptions.retainWorktree && resolvedIsolation !== "worktree") {
+      throw new TypeError("retainWorktree requires isolation: 'worktree'");
+    }
+    const capabilityCall = agentOptions.retainWorktree === true || agentOptions.worktree !== undefined;
+    if (capabilityCall) markRetainedWorktreeUse(executionContext, operationScopeKey);
 
     // Model precedence: explicit agentOptions.model > agentType.model > tier > phase model.
     // The "explicit-level" model is opts.model, else the definition's model — either
@@ -509,11 +617,31 @@ export async function runWorkflow<T = unknown>(
     const callHash = hashAgentCall(prompt, modelSpec, assignedPhase, agentOptions, agentDefinitionKey(agentDef));
     const deltaKey = callKey;
 
-    // Reserve the agent slot synchronously — atomic with the limit/budget gate
-    // above (no await in between) — so a parallel() fan-out can't all observe the
-    // same agentCount and overshoot maxAgents. (Token budget stays a soft gate:
-    // spent accrues after each agent, matching Claude Code; in-flight agents may
-    // push slightly past total, then further agent() calls throw.)
+    // Retained consumers validate and reserve FIFO admission before they charge
+    // maxAgents. Invalid/released/cross-root handles therefore cannot consume a
+    // slot. A valid lease is released below if any later admission gate fails.
+    const admittedRetainedLease =
+      agentOptions.worktree === undefined
+        ? undefined
+        : executionContext.retainedWorktrees.acquire(agentOptions.worktree, operationAdmission);
+
+    if (shared.agentCount >= maxAgents) {
+      if (admittedRetainedLease !== undefined) {
+        void admittedRetainedLease.then(
+          (lease) => lease.release(),
+          () => undefined,
+        );
+      }
+      throw new WorkflowError(
+        `Agent limit exceeded (${maxAgents}). Use maxAgents option to increase the limit.`,
+        WorkflowErrorCode.AGENT_LIMIT_EXCEEDED,
+        { recoverable: false },
+      );
+    }
+
+    // Reserve the agent slot synchronously — atomic with the limit gate above —
+    // so a parallel() fan-out cannot overshoot maxAgents. Token budget remains a
+    // soft gate because delayed telemetry may arrive after concurrent admission.
     shared.agentCount++;
     localAgentCount++;
     const label = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount);
@@ -523,15 +651,17 @@ export async function runWorkflow<T = unknown>(
     // call. Once any call misses, it AND everything after it run live (matching
     // Claude Code's contract), so an edited upstream call never leaves stale
     // downstream results served from the journal.
-    const cached = resumeEntry(options.resumeJournal, {
-      callKey,
-      callIndex,
-      scopeKey: options.scopeKey ?? "root",
-      accountingScopeKey,
-      accountingCallKey,
-      kind: "agent",
-      callHash,
-    });
+    const cached = capabilityCall
+      ? undefined
+      : resumeEntry(options.resumeJournal, {
+          callKey,
+          callIndex,
+          scopeKey: options.scopeKey ?? "root",
+          accountingScopeKey,
+          accountingCallKey,
+          kind: "agent",
+          callHash,
+        });
     const hashMatches = cached != null;
     const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
     if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
@@ -568,37 +698,71 @@ export async function runWorkflow<T = unknown>(
     // unchanged prefix ends; this call and every later one then run live.
     if (!hashMatches || cachedEmptyOutput) state.firstMiss = Math.min(state.firstMiss, callIndex);
 
+    let limiterStarted = false;
     const invocation = limiter(async () => {
+      limiterStarted = true;
       const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
       const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
       const maxAttempts = retryAttempts + 1;
 
-      options.onAgentStart?.({
-        label,
-        phase: assignedPhase,
-        prompt,
-        model: displayModel,
-        key: callKey,
-        accountingCallKey,
-      });
-
-      // Optional per-agent worktree isolation (deterministic name -> stable resume keys).
-      // Precedence: explicit call-site isolation > agentDef isolation.
-      // Note: passing { isolation: undefined } falls through ?? to the def's value — there
-      // is no sentinel to suppress a def's isolation at the call site. Remove the agentType
-      // or override with a def that has no isolation field if opt-out is needed.
+      // Ordinary isolation owns its worktree only for this call. A retained producer
+      // registers the runtime-created tree before attempts begin; a consumer takes a
+      // FIFO-exclusive lease on an existing registration.
       let worktree: Worktree | undefined;
-      const resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation;
-      if (resolvedIsolation === "worktree") {
-        worktree = await createWorktree(baseCwd, `${runId}-${callIndex}-${label}`);
-        if (!worktree.isolated) log(`isolation ignored for "${label}" (${worktree.reason})`);
-      }
-      const runCwd = worktree?.isolated ? worktree.cwd : undefined;
-
-      const logicalUsage = shared.usage.priorAttemptUsage(callKey, callHash, accountingCallKey, accountingScopeKey);
-      const firstAttemptNumber = shared.usage.nextAttemptNumber(callKey, accountingCallKey, accountingScopeKey);
-
+      let retainedHandle: WorktreeHandle | undefined;
+      let retainedLease: RetainedWorktreeLease | undefined;
       try {
+        if (admittedRetainedLease !== undefined) {
+          retainedLease = await admittedRetainedLease;
+          worktree = retainedLease.worktree;
+        } else if (resolvedIsolation === "worktree") {
+          worktree = await (options.worktreeOperations ?? DEFAULT_WORKTREE_OPERATIONS).createWorktree(
+            baseCwd,
+            `${runId}-${callIndex}`,
+          );
+          if (!worktree.isolated) {
+            if (worktree.creationRecoveryWorktree) {
+              executionContext.terminalRetryWorktrees.add(worktree.creationRecoveryWorktree);
+            }
+            if (worktree.recoveryFailures && worktree.recoveryFailures.length > 0) {
+              const safeFailures = worktree.recoveryFailures.map(boundWorktreeCleanupFailure);
+              log("isolation ignored because worktree creation recovery failed");
+              for (const failure of safeFailures) reportWorktreeCleanupFailure(failure);
+              throw new WorkflowError(
+                "Worktree creation recovery failed; inspect bounded cleanup diagnostics",
+                WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+                { recoverable: false, details: safeFailures },
+              );
+            }
+            log(`isolation ignored for "${label}" (${worktree.reason})`);
+            if (agentOptions.retainWorktree) {
+              throw new WorkflowError(
+                `Cannot retain worktree for "${label}": ${worktree.reason ?? "isolation unavailable"}`,
+                WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+                { recoverable: false },
+              );
+            }
+          } else if (agentOptions.retainWorktree) {
+            retainedHandle = executionContext.retainedWorktrees.register(worktree, operationAdmission);
+          }
+        }
+        const runCwd = worktree?.isolated ? worktree.cwd : undefined;
+        options.onAgentStart?.({
+          label,
+          phase: assignedPhase,
+          prompt,
+          model: displayModel,
+          key: callKey,
+          accountingCallKey,
+        });
+        const publicResult = (result: unknown): unknown =>
+          retainedHandle === undefined
+            ? result
+            : ({ result, worktree: retainedHandle } satisfies RetainedWorktreeResult<unknown>);
+
+        const logicalUsage = shared.usage.priorAttemptUsage(callKey, callHash, accountingCallKey, accountingScopeKey);
+        const firstAttemptNumber = shared.usage.nextAttemptNumber(callKey, accountingCallKey, accountingScopeKey);
+
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           const admissionFailure = shared.usage.admissionFailure(assignedPhaseKey);
           if (admissionFailure) {
@@ -698,24 +862,27 @@ export async function runWorkflow<T = unknown>(
             mergeTokenUsage(logicalUsage, attemptUsage);
             const tokens = logicalUsage.total;
             const storeDelta = store.commitSequencedDelta(deltaKey);
-            options.onAgentJournal?.({
-              index: callIndex,
-              key: callKey,
-              kind: "agent",
-              hash: callHash,
-              result,
-              usage: structuredClone(logicalUsage),
-              tokens,
-              agentCount: 1,
-              accountingScopeKey,
-              accountingCallKey,
-              storeDelta: storeDelta.values,
-              storeDeltaSequences: storeDelta.sequences,
-            });
+            if (!capabilityCall) {
+              options.onAgentJournal?.({
+                index: callIndex,
+                key: callKey,
+                kind: "agent",
+                hash: callHash,
+                result,
+                usage: structuredClone(logicalUsage),
+                tokens,
+                agentCount: 1,
+                accountingScopeKey,
+                accountingCallKey,
+                storeDelta: storeDelta.values,
+                storeDeltaSequences: storeDelta.sequences,
+              });
+            }
+            const returnedResult = publicResult(result);
             options.onAgentEnd?.({
               label,
               phase: assignedPhase,
-              result,
+              result: returnedResult,
               tokens,
               tokenUsage: agentUsageFromTokenUsage(logicalUsage),
               worktree: runCwd,
@@ -723,7 +890,7 @@ export async function runWorkflow<T = unknown>(
               key: callKey,
               accountingCallKey,
             });
-            return result;
+            return returnedResult;
           } catch (error) {
             const liveExhaustion = shared.usage.exhaustionFor(attemptId);
             const wrapped = wrapError(error, { agentLabel: label });
@@ -781,18 +948,58 @@ export async function runWorkflow<T = unknown>(
               log(
                 `agent "${label}" exhausted ${maxAttempts} attempt${maxAttempts === 1 ? "" : "s"}: ${workflowError.code} ${workflowError.message}`,
               );
-              return null;
+              return publicResult(null);
             }
             throw workflowError;
           }
         }
-        return null;
+        return publicResult(null);
       } finally {
-        // Always tear down the worktree, even on timeout/abort.
-        if (worktree?.isolated) await removeWorktree(worktree);
+        retainedLease?.release();
+        // Retained producers are root-owned after registration. Ordinary isolated
+        // calls preserve the historical immediate teardown behavior.
+        if (worktree?.isolated && retainedHandle === undefined && agentOptions.worktree === undefined) {
+          try {
+            const failures =
+              (await (options.worktreeOperations ?? DEFAULT_WORKTREE_OPERATIONS).removeWorktree(worktree)) ?? [];
+            for (const failure of failures) reportWorktreeCleanupFailure(failure);
+            if (failures.length > 0) executionContext.terminalProofWorktrees.add(worktree);
+          } catch (error) {
+            reportWorktreeCleanupFailure(worktreeCleanupDispatchFailure(worktree, error));
+            executionContext.terminalProofWorktrees.add(worktree);
+          }
+        }
       }
+    }).catch(async (error: unknown) => {
+      if (!limiterStarted && admittedRetainedLease !== undefined) {
+        const lease = await admittedRetainedLease;
+        lease.release();
+      }
+      throw error;
     });
-    return trackRuntimeOperation(shared, operationScopeKey, invocation);
+    return invocation;
+  };
+
+  const agent = (prompt: string, callerOptions: unknown = {}): Promise<unknown> => {
+    let admission: RootOperationAdmission;
+    let agentOptions: Readonly<AgentOptions>;
+    try {
+      // Workflow code retains ownership of its options object. Snapshot every
+      // recognized field by explicit read before admission or any other runtime
+      // side effect. This preserves inherited/non-enumerable fields while never
+      // consulting the caller-owned object again after validation.
+      agentOptions = snapshotAgentOptions(callerOptions);
+      admission = executionContext.admitOperation(options.operationAdmission);
+    } catch (error) {
+      return safelyRejectedOperation(error);
+    }
+    return trackRuntimeOperation(
+      shared,
+      executionContext,
+      operationScopeKey,
+      runAgent(admission, prompt, agentOptions),
+      admission,
+    );
   };
 
   const parallel = async (thunks: Array<() => Promise<unknown>>) => {
@@ -856,10 +1063,35 @@ export async function runWorkflow<T = unknown>(
   const workflowFn = (
     ...workflowArgs: [nameOrScript: string, childArgs?: unknown, childOptions?: NestedWorkflowOptions]
   ) => {
-    const [nameOrScript, childArgs, childOptions] = workflowArgs;
+    const [nameOrScript, callerChildArgs, callerChildOptions] = workflowArgs;
     const childArgsProvided = workflowArgs.length >= 2;
+    let workflowNameInput: string;
+    let childArgs: unknown;
+    let childOptions: Readonly<NestedWorkflowOptions> | undefined;
+    let explicitKey: string | undefined;
+    let carriesRetainedWorktree = false;
+    let admission: RootOperationAdmission;
+    try {
+      // Validate and clone every caller-owned value before admission. This keeps
+      // synchronous snapshot semantics while ensuring every validation, clone,
+      // proxy, accessor, cycle, and capability failure is returned as a rejected
+      // Promise from workflow(), rather than escaping before .catch can attach.
+      workflowNameInput = String(nameOrScript);
+      validateNestedWorkflowOptions(callerChildOptions);
+      childOptions = callerChildOptions === undefined ? undefined : Object.freeze({ ...callerChildOptions });
+      explicitKey = normalizeNestedWorkflowKey(childOptions);
+      if (childArgsProvided) {
+        const snapshot = snapshotNestedWorkflowArgs(callerChildArgs, executionContext.retainedWorktrees);
+        childArgs = snapshot.value;
+        carriesRetainedWorktree = snapshot.carriesRetainedWorktree;
+      }
+      admission = executionContext.admitOperation(options.operationAdmission);
+    } catch (error) {
+      return safelyRejectedOperation(error);
+    }
     return trackRuntimeOperation(
       shared,
+      executionContext,
       operationScopeKey,
       (async () => {
         throwIfAborted();
@@ -872,8 +1104,7 @@ export async function runWorkflow<T = unknown>(
             },
           );
         }
-        const explicitKey = normalizeNestedWorkflowKey(childOptions);
-        const workflowName = String(nameOrScript);
+        const workflowName = workflowNameInput;
         const resolved = options.loadSavedWorkflow?.(workflowName);
         const childScript = resolved ?? workflowName;
         const implicitIdentity = hashNestedWorkflowIdentity(
@@ -881,6 +1112,7 @@ export async function runWorkflow<T = unknown>(
           childScript,
           childArgsProvided,
           childArgs,
+          executionContext.retainedWorktrees,
         );
         let childAccountingScope: string;
         if (explicitKey !== undefined) {
@@ -906,21 +1138,30 @@ export async function runWorkflow<T = unknown>(
           childAccountingScope = `${accountingScopeKey}/workflow:${implicitIdentity}/occurrence:0`;
         }
         const childOperationScope = `${childAccountingScope}/invocation:${randomUUID()}`;
+        if (carriesRetainedWorktree) markRetainedWorktreeUse(executionContext, childOperationScope);
         const callIndex = state.callSeq++;
         const callKey = `${scopeKey}/call:${callIndex}`;
         const childJournalScope = `${callKey}/workflow`;
         const wrapperAccountingCallKey = stableAccountingCallKey(accountingScopeKey, callIndex);
-        const callHash = hashNestedWorkflow(childScript, childArgsProvided, childArgs, explicitKey);
+        const callHash = hashNestedWorkflow(
+          childScript,
+          childArgsProvided,
+          childArgs,
+          executionContext.retainedWorktrees,
+          explicitKey,
+        );
         // Wrapper checkpoints intentionally remain positional. A keyed wrapper miss
         // can still reuse stable descendant journals from its accounting scope.
-        const cached = resumeEntry(options.resumeJournal, {
-          callKey,
-          callIndex,
-          scopeKey: options.scopeKey ?? "root",
-          accountingScopeKey: childAccountingScope,
-          kind: "workflow",
-          callHash,
-        });
+        const cached = carriesRetainedWorktree
+          ? undefined
+          : resumeEntry(options.resumeJournal, {
+              callKey,
+              callIndex,
+              scopeKey: options.scopeKey ?? "root",
+              accountingScopeKey: childAccountingScope,
+              kind: "workflow",
+              callHash,
+            });
         if (cached && callIndex < state.firstMiss) {
           const replayedAgents = cached.agentCount ?? 0;
           if (shared.agentCount + replayedAgents > maxAgents) {
@@ -977,6 +1218,8 @@ export async function runWorkflow<T = unknown>(
           ...options,
           args: childArgs,
           sharedRuntime: shared,
+          executionContext,
+          operationAdmission: admission,
           sharedStore: store,
           scopeKey: childJournalScope,
           accountingScopeKey: childAccountingScope,
@@ -1002,23 +1245,26 @@ export async function runWorkflow<T = unknown>(
         });
         const storeDelta = store.commitSequencedScopeDeltas(childJournalScope);
         const childUsage = shared.usage.usageForScope(childAccountingScope);
-        options.onAgentJournal?.({
-          index: callIndex,
-          key: callKey,
-          kind: "workflow",
-          hash: callHash,
-          result: child.result,
-          usage: childUsage,
-          tokens: childUsage.total,
-          agentCount: child.agentCount,
-          descendantAgentAccountingCallKeys: [...descendantAgentAccountingCallKeys],
-          accountingScopeKey: childAccountingScope,
-          accountingCallKey: wrapperAccountingCallKey,
-          storeDelta: storeDelta.values,
-          storeDeltaSequences: storeDelta.sequences,
-        });
+        if (!consumeRetainedWorktreeUse(executionContext, childOperationScope)) {
+          options.onAgentJournal?.({
+            index: callIndex,
+            key: callKey,
+            kind: "workflow",
+            hash: callHash,
+            result: child.result,
+            usage: childUsage,
+            tokens: childUsage.total,
+            agentCount: child.agentCount,
+            descendantAgentAccountingCallKeys: [...descendantAgentAccountingCallKeys],
+            accountingScopeKey: childAccountingScope,
+            accountingCallKey: wrapperAccountingCallKey,
+            storeDelta: storeDelta.values,
+            storeDeltaSequences: storeDelta.sequences,
+          });
+        }
         return child.result;
       })(),
+      admission,
     );
   };
 
@@ -1181,9 +1427,16 @@ export async function runWorkflow<T = unknown>(
   // replays by callIndex exactly like a cached agent() — the genuine edge over CC,
   // whose steering is in-session only. Headless (no UI threaded in): takes the
   // declared default and journals THAT, so a detached/background run never hangs.
-  const checkpoint = (promptText: string, checkpointOptions: CheckpointOptions = {}) =>
-    trackRuntimeOperation(
+  const checkpoint = (promptText: string, checkpointOptions: CheckpointOptions = {}) => {
+    let admission: RootOperationAdmission;
+    try {
+      admission = executionContext.admitOperation(options.operationAdmission);
+    } catch (error) {
+      return safelyRejectedOperation(error);
+    }
+    return trackRuntimeOperation(
       shared,
+      executionContext,
       operationScopeKey,
       (async () => {
         throwIfAborted();
@@ -1243,10 +1496,30 @@ export async function runWorkflow<T = unknown>(
         });
         return reply;
       })(),
+      admission,
     );
+  };
+
+  const releaseWorktree = (handle: unknown): Promise<void> => {
+    let admission: RootOperationAdmission;
+    try {
+      admission = executionContext.admitOperation(options.operationAdmission);
+    } catch (error) {
+      return safelyRejectedOperation(error);
+    }
+    let release: Promise<void>;
+    try {
+      release = executionContext.retainedWorktrees.release(handle, admission);
+    } catch (error) {
+      executionContext.completeOperationAdmission(admission);
+      return safelyRejectedOperation(error);
+    }
+    return trackRuntimeOperation(shared, executionContext, operationScopeKey, release, admission);
+  };
 
   const context = vm.createContext({
     agent,
+    releaseWorktree,
     parallel,
     pipeline,
     workflow: workflowFn,
@@ -1276,6 +1549,7 @@ export async function runWorkflow<T = unknown>(
   });
 
   const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
+  let completedResult: WorkflowRunResult<T> | undefined;
   try {
     let result: unknown;
     let scriptFailure: unknown;
@@ -1286,13 +1560,15 @@ export async function runWorkflow<T = unknown>(
       scriptFailed = true;
       scriptFailure = error;
     }
+    if (ownsExecutionContext) executionContext.closeOperationAdmission();
 
     // Native Promise.all is fail-fast and can discard sibling operations. Every
-    // invocation drains only its own descendants; the root additionally owns the
-    // global registry used by manager lease/deletion safety.
+    // nested invocation drains only its own descendants. A top-level invocation
+    // drains its explicit root group, while the shared global registry remains
+    // available only for manager stop/abort lease and deletion safety.
     const liveFailures =
       invocationDepth === 0
-        ? await settleLiveInvocations(shared)
+        ? await settleRootOperations(executionContext)
         : await settleOwnedOperations(shared, operationScopeKey);
     // Resolve terminal state only after owned operations drain. Parent abort is
     // always terminal. Otherwise an uncaught script/runner error remains the
@@ -1337,7 +1613,7 @@ export async function runWorkflow<T = unknown>(
             overshoot: Math.max(0, runtimeCheckpoint.usage.total - options.tokenBudget),
           };
 
-    return {
+    completedResult = {
       meta,
       result: result as T,
       logs: state.logs,
@@ -1349,7 +1625,53 @@ export async function runWorkflow<T = unknown>(
       runtimeCheckpoint,
       budget: budgetStatus,
     };
+    return completedResult;
   } finally {
+    // Only the root owns terminal cleanup. Nested workflow settlement must leave
+    // shared handles available to later parent steps. cleanupAll closes admission,
+    // waits any active/admitted consumers, and never masks the primary outcome.
+    if (ownsExecutionContext) {
+      executionContext.retainedWorktrees.closeAdmission();
+      await executionContext.retainedWorktrees.cleanupAll();
+      const operations = options.worktreeOperations ?? DEFAULT_WORKTREE_OPERATIONS;
+      await Promise.allSettled(
+        [...executionContext.terminalRetryWorktrees].map(async (worktree) => {
+          let terminalFailures: WorktreeCleanupFailure[];
+          try {
+            terminalFailures = (await operations.removeWorktree(worktree)) ?? [];
+          } catch (error) {
+            terminalFailures = [worktreeCleanupDispatchFailure(worktree, error)];
+          }
+          for (const failure of terminalFailures) reportWorktreeCleanupFailure(failure);
+          if (terminalFailures.length > 0) {
+            await disposeWorktreeProofsSafely(operations, worktree, reportWorktreeCleanupFailure);
+          }
+        }),
+      );
+      executionContext.terminalRetryWorktrees.clear();
+      await Promise.allSettled(
+        [...executionContext.terminalProofWorktrees].map((worktree) =>
+          disposeWorktreeProofsSafely(operations, worktree, reportWorktreeCleanupFailure),
+        ),
+      );
+      executionContext.terminalProofWorktrees.clear();
+      if (executionContext.worktreeCleanupFailures.length > 0) {
+        for (const failure of executionContext.worktreeCleanupFailures) {
+          // Deliberately omit messages and identities: both can carry absolute
+          // paths. Exact bounded recovery data is available on result/status.
+          try {
+            log(`retained worktree cleanup failed at ${failure.stage}; inspect worktreeCleanupFailures metadata`);
+          } catch {
+            // Cleanup observability must never replace the primary outcome.
+          }
+        }
+        if (completedResult) {
+          completedResult.worktreeCleanupFailures = executionContext.worktreeCleanupFailures.map((failure) =>
+            boundWorktreeCleanupFailure(failure),
+          );
+        }
+      }
+    }
     // Dispose the store only when this run created it, and only after the root
     // ownership drain above has observed every live invocation settle.
     if (!options.sharedStore) store.dispose();
@@ -1426,12 +1748,121 @@ function syncCompatibilityRuntime(shared: ActiveSharedRuntime): void {
   shared.tokenUsage = shared.usage.usage;
 }
 
+function detachedWorktreeCleanupFailure(failure: WorktreeCleanupFailure): WorktreeCleanupFailure {
+  return {
+    stage: failure.stage,
+    message: failure.message,
+    identity: { ...failure.identity },
+  };
+}
+
+function immutableWorktreeCleanupFailure(failure: WorktreeCleanupFailure): WorktreeCleanupFailure {
+  const identity = Object.freeze({ ...failure.identity });
+  return Object.freeze({
+    stage: failure.stage,
+    message: failure.message,
+    identity,
+  });
+}
+
+function createRootExecutionContext(
+  operations: WorktreeOperations | undefined,
+  onCleanupFailure: ((failure: WorktreeCleanupFailure) => void | PromiseLike<void>) | undefined,
+): RootExecutionContext {
+  const worktreeCleanupFailures: WorktreeCleanupFailure[] = [];
+  const worktreeCleanupFailureKeys = new Set<string>();
+  const admissionOwner = Symbol("root-operation-admission");
+  const activeAdmissions = new WeakSet<RootOperationAdmission>();
+  let operationAdmissionOpen = true;
+  const validAdmission = (candidate: unknown): candidate is RootOperationAdmission =>
+    typeof candidate === "object" &&
+    candidate !== null &&
+    (candidate as RootOperationAdmission).owner === admissionOwner &&
+    activeAdmissions.has(candidate as RootOperationAdmission);
+  const admitOperation = (parent?: RootOperationAdmission): RootOperationAdmission => {
+    if (parent !== undefined ? !validAdmission(parent) : !operationAdmissionOpen) {
+      throw new WorkflowError(
+        "Root execution admission is closed after script settlement",
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
+    const admission = Object.freeze({ owner: admissionOwner });
+    activeAdmissions.add(admission);
+    return admission;
+  };
+  const reportCleanupFailure = (failure: WorktreeCleanupFailure): CleanupFailureCollectionResult => {
+    const bounded = boundWorktreeCleanupFailure(failure);
+    const key = JSON.stringify(bounded);
+    if (worktreeCleanupFailureKeys.has(key) || worktreeCleanupFailures.length >= MAX_WORKTREE_CLEANUP_FAILURES) {
+      return {};
+    }
+    worktreeCleanupFailureKeys.add(key);
+    const stored = immutableWorktreeCleanupFailure(detachedWorktreeCleanupFailure(bounded));
+    worktreeCleanupFailures.push(stored);
+    const admittedFailure = immutableWorktreeCleanupFailure(detachedWorktreeCleanupFailure(stored));
+    try {
+      const callbackResult = onCleanupFailure?.(detachedWorktreeCleanupFailure(stored));
+      if (callbackResult !== undefined) {
+        // User diagnostics are never on the workflow critical path, but every
+        // Promise/thenable rejection must still be consumed.
+        void Promise.resolve(callbackResult).catch(() => undefined);
+      }
+      return { admittedFailure };
+    } catch (error) {
+      return {
+        admittedFailure,
+        callbackFailure: boundWorktreeCleanupFailure({
+          stage: "cleanup_dispatch",
+          message: error instanceof Error ? error.message : String(error),
+          identity: detachedWorktreeCleanupFailure(stored).identity,
+        }),
+      };
+    }
+  };
+  return {
+    retainedWorktrees: new RetainedWorktreeRegistry(
+      operations ?? DEFAULT_WORKTREE_OPERATIONS,
+      reportCleanupFailure,
+      validAdmission,
+    ),
+    admitOperation,
+    completeOperationAdmission: (admission) => activeAdmissions.delete(admission),
+    closeOperationAdmission: () => {
+      operationAdmissionOpen = false;
+    },
+    retainedWorktreeUseScopes: new Set<string>(),
+    worktreeCleanupFailures,
+    reportWorktreeCleanupFailure: reportCleanupFailure,
+    terminalProofWorktrees: new Set<Worktree>(),
+    terminalRetryWorktrees: new Set<Worktree>(),
+    liveOperations: new Set<Promise<unknown>>(),
+  };
+}
+
+function markRetainedWorktreeUse(context: RootExecutionContext, operationScopeKey: string): void {
+  context.retainedWorktreeUseScopes.add(operationScopeKey);
+}
+
+function consumeRetainedWorktreeUse(context: RootExecutionContext, operationScopeKey: string): boolean {
+  return context.retainedWorktreeUseScopes.delete(operationScopeKey);
+}
+
+function safelyRejectedOperation(error: unknown): Promise<never> {
+  const rejection = Promise.reject(error);
+  void rejection.catch(() => undefined);
+  return rejection;
+}
+
 function trackRuntimeOperation<T>(
   shared: ActiveSharedRuntime,
+  executionContext: RootExecutionContext,
   ownerScopeKey: string,
   operation: Promise<T>,
+  admission?: RootOperationAdmission,
 ): Promise<T> {
   shared.liveInvocations.add(operation);
+  executionContext.liveOperations.add(operation);
   let owned = shared.liveOperationsByScope.get(ownerScopeKey);
   if (!owned) {
     owned = new Set<Promise<unknown>>();
@@ -1439,7 +1870,9 @@ function trackRuntimeOperation<T>(
   }
   owned.add(operation);
   const release = () => {
+    if (admission) executionContext.completeOperationAdmission(admission);
     shared.liveInvocations.delete(operation);
+    executionContext.liveOperations.delete(operation);
     owned?.delete(operation);
     if (owned?.size === 0 && shared.liveOperationsByScope.get(ownerScopeKey) === owned) {
       shared.liveOperationsByScope.delete(ownerScopeKey);
@@ -1464,18 +1897,18 @@ async function settleOwnedOperations(shared: ActiveSharedRuntime, ownerScopeKey:
   return failures;
 }
 
-async function settleLiveInvocations(shared: ActiveSharedRuntime): Promise<unknown[]> {
+async function settleRootOperations(executionContext: RootExecutionContext): Promise<unknown[]> {
   const failures: unknown[] = [];
   do {
-    const settled = await Promise.allSettled([...shared.liveInvocations]);
+    const settled = await Promise.allSettled([...executionContext.liveOperations]);
     for (const result of settled) {
       if (result.status === "rejected") failures.push(result.reason);
     }
     // A settled checkpoint/workflow can resume a native-Promise branch whose
-    // continuation registers another runtime operation. Observe one complete
-    // event-loop turn before declaring the ownership registry stably empty.
+    // continuation registers another operation in this root. Observe one full
+    // event-loop turn before declaring this root's registry stably empty.
     await new Promise<void>((resolve) => setImmediate(resolve));
-  } while (shared.liveInvocations.size > 0);
+  } while (executionContext.liveOperations.size > 0);
   return failures;
 }
 
@@ -1631,6 +2064,81 @@ function createLimiter(limit: number) {
 
 function defaultAgentLabel(phase: string | undefined, index: number): string {
   return phase ? `${phase} agent ${index}` : `agent ${index}`;
+}
+
+function invalidAgentOptions(message: string): WorkflowError {
+  return new WorkflowError(`Invalid agent options: ${message}`, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
+    recoverable: false,
+  });
+}
+
+function snapshotAgentOptions(value: unknown): Readonly<AgentOptions> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw invalidAgentOptions("agent() second argument must be an options object");
+  }
+
+  const source = value as AgentOptions;
+  const read = <K extends keyof AgentOptions>(key: K): AgentOptions[K] => {
+    try {
+      return source[key];
+    } catch {
+      throw invalidAgentOptions(`${key} property accessor could not be read`);
+    }
+  };
+  const options: AgentOptions = {
+    label: read("label"),
+    phase: read("phase"),
+    schema: read("schema"),
+    model: read("model"),
+    tier: read("tier"),
+    isolation: read("isolation"),
+    retainWorktree: read("retainWorktree"),
+    worktree: read("worktree"),
+    agentType: read("agentType"),
+    timeoutMs: read("timeoutMs"),
+    retries: read("retries"),
+  };
+
+  for (const key of ["label", "phase", "model", "tier", "agentType"] as const) {
+    if (options[key] !== undefined && typeof options[key] !== "string") {
+      throw invalidAgentOptions(`${key} must be a string`);
+    }
+  }
+  if (
+    options.schema !== undefined &&
+    (options.schema === null || typeof options.schema !== "object" || Array.isArray(options.schema))
+  ) {
+    throw invalidAgentOptions("schema must be an object");
+  }
+  if (options.isolation !== undefined && options.isolation !== "worktree") {
+    throw invalidAgentOptions("isolation must be 'worktree'");
+  }
+  if (options.retainWorktree !== undefined && typeof options.retainWorktree !== "boolean") {
+    throw invalidAgentOptions("retainWorktree must be a boolean");
+  }
+  if (
+    options.worktree !== undefined &&
+    (options.worktree === null || typeof options.worktree !== "object" || Array.isArray(options.worktree))
+  ) {
+    throw invalidAgentOptions("worktree must be a runtime-issued handle object");
+  }
+  if (
+    options.timeoutMs !== undefined &&
+    options.timeoutMs !== null &&
+    (typeof options.timeoutMs !== "number" || !Number.isFinite(options.timeoutMs) || options.timeoutMs < 0)
+  ) {
+    throw invalidAgentOptions("timeoutMs must be a non-negative finite number or null");
+  }
+  if (
+    options.retries !== undefined &&
+    (typeof options.retries !== "number" || !Number.isFinite(options.retries) || options.retries < 0)
+  ) {
+    throw invalidAgentOptions("retries must be a non-negative finite number");
+  }
+  if (options.worktree !== undefined && (options.isolation !== undefined || options.retainWorktree === true)) {
+    throw invalidAgentOptions("worktree cannot be combined with isolation or retainWorktree: true");
+  }
+  return Object.freeze(options);
 }
 
 /** Stable identity hash for an agent() call — a cache miss on resume when anything changes. */
@@ -1857,27 +2365,47 @@ function hasAmbiguousLegacyJournal(journal: Map<string | number, JournalEntry> |
   return [...journal.entries()].some(([key, entry]) => typeof key === "number" || !entry.key);
 }
 
-function hashNestedWorkflow(script: string, argsProvided: boolean, args: unknown, explicitKey?: string): string {
+function hashNestedWorkflow(
+  script: string,
+  argsProvided: boolean,
+  args: unknown,
+  retainedWorktrees: RetainedWorktreeRegistry,
+  explicitKey?: string,
+): string {
   return sha256(
     canonicalEncode(
       explicitKey === undefined
         ? { script, args: nestedArgsIdentity(argsProvided, args) }
         : { script, args: nestedArgsIdentity(argsProvided, args), key: explicitKey },
       "workflow identity",
+      retainedWorktrees,
     ),
   );
 }
 
-function normalizeNestedWorkflowKey(options: NestedWorkflowOptions | undefined): string | undefined {
-  if (options === undefined) return undefined;
-  if (options === null || typeof options !== "object") {
+function validateNestedWorkflowOptions(options: unknown): asserts options is NestedWorkflowOptions | undefined {
+  if (options === undefined) return;
+  let isPlainObject = false;
+  if (typeof options === "object" && options !== null && !Array.isArray(options)) {
+    try {
+      const prototype = Object.getPrototypeOf(options);
+      isPlainObject = prototype === null || Object.getPrototypeOf(prototype) === null;
+    } catch {
+      isPlainObject = false;
+    }
+  }
+  if (!isPlainObject) {
     throw new WorkflowError(
       "workflow() third argument must be an options object",
       WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
       { recoverable: false },
     );
   }
-  if (options.key === undefined) return undefined;
+}
+
+function normalizeNestedWorkflowKey(options: Readonly<NestedWorkflowOptions> | undefined): string | undefined {
+  validateNestedWorkflowOptions(options);
+  if (options === undefined || options.key === undefined) return undefined;
   if (typeof options.key !== "string" || options.key.trim().length === 0) {
     throw new WorkflowError(
       "workflow() third-argument key must be a non-empty string",
@@ -1893,10 +2421,15 @@ function hashNestedWorkflowIdentity(
   script: string,
   argsProvided: boolean,
   args: unknown,
+  retainedWorktrees: RetainedWorktreeRegistry,
 ): string {
   const workflowIdentity = savedName === undefined ? { rawScript: sha256(script) } : { savedWorkflow: savedName };
   return sha256(
-    canonicalEncode({ workflowIdentity, args: nestedArgsIdentity(argsProvided, args) }, "workflow identity"),
+    canonicalEncode(
+      { workflowIdentity, args: nestedArgsIdentity(argsProvided, args) },
+      "workflow identity",
+      retainedWorktrees,
+    ),
   );
 }
 
@@ -1909,7 +2442,12 @@ function nestedArgsIdentity(provided: boolean, value: unknown): unknown {
 }
 
 /** Collision-resistant typed canonical encoding for nested workflow identity. */
-function canonicalEncode(value: unknown, rootPath: string): string {
+function canonicalEncode(
+  value: unknown,
+  rootPath: string,
+  retainedWorktrees?: RetainedWorktreeRegistry,
+  onRetainedHandle?: () => void,
+): string {
   const ancestors = new WeakSet<object>();
   const encode = (item: unknown, path: string): unknown => {
     if (item === null) return ["null"];
@@ -1928,6 +2466,11 @@ function canonicalEncode(value: unknown, rootPath: string): string {
     }
     if (typeof item !== "object") {
       throw invalidNestedIdentity(`${path} contains unsupported value type ${typeof item}`);
+    }
+    const retainedIdentity = retainedWorktrees?.canonicalIdentity(item);
+    if (retainedIdentity !== undefined) {
+      onRetainedHandle?.();
+      return ["retained-worktree", retainedIdentity];
     }
     if (ancestors.has(item)) {
       throw invalidNestedIdentity(`${path} is cyclic; nested workflow args must be acyclic`);
@@ -1986,6 +2529,92 @@ function canonicalEncode(value: unknown, rootPath: string): string {
     }
   };
   return JSON.stringify(encode(value, rootPath));
+}
+
+function snapshotNestedWorkflowArgs(
+  value: unknown,
+  retainedWorktrees: RetainedWorktreeRegistry,
+): { value: unknown; carriesRetainedWorktree: boolean } {
+  const ancestors = new WeakSet<object>();
+  let carriesRetainedWorktree = false;
+  const clone = (item: unknown, path: string): unknown => {
+    if (
+      item === null ||
+      item === undefined ||
+      typeof item === "string" ||
+      typeof item === "boolean" ||
+      typeof item === "number"
+    ) {
+      return item;
+    }
+    if (typeof item === "bigint" || typeof item === "function" || typeof item === "symbol") {
+      throw invalidNestedIdentity(`${path} contains unsupported ${typeof item}; pass data-only JSON-like values`);
+    }
+    if (typeof item !== "object") {
+      throw invalidNestedIdentity(`${path} contains unsupported value type ${typeof item}`);
+    }
+
+    const retainedIdentity = retainedWorktrees.canonicalIdentity(item);
+    if (retainedIdentity !== undefined) {
+      carriesRetainedWorktree = true;
+      return item;
+    }
+    if (ancestors.has(item)) {
+      throw invalidNestedIdentity(`${path} is cyclic; nested workflow args must be acyclic`);
+    }
+    ancestors.add(item);
+    try {
+      if (Array.isArray(item)) {
+        assertNativeDataPrototype(item, "Array", path);
+        const descriptors = Object.getOwnPropertyDescriptors(item);
+        for (const key of Reflect.ownKeys(descriptors)) {
+          if (typeof key === "symbol") {
+            throw invalidNestedIdentity(`${path} array contains unsupported symbol properties`);
+          }
+          const descriptor = descriptors[key];
+          if (key === "length") {
+            if (
+              !("value" in descriptor) ||
+              descriptor.enumerable ||
+              descriptor.configurable ||
+              descriptor.writable !== true
+            ) {
+              throw invalidNestedIdentity(`${path} has a non-standard array length property`);
+            }
+            continue;
+          }
+          if (!isArrayIndex(key, item.length)) {
+            throw invalidNestedIdentity(`${path} array contains custom property ${JSON.stringify(key)}`);
+          }
+          assertEnumerableDataDescriptor(descriptor, `${path}[${key}]`);
+        }
+        const result = new Array<unknown>(item.length);
+        for (let index = 0; index < item.length; index++) {
+          const descriptor = descriptors[String(index)];
+          if (descriptor) result[index] = clone(descriptor.value, `${path}[${index}]`);
+        }
+        return result;
+      }
+
+      const prototype = Object.getPrototypeOf(item);
+      if (prototype !== null) assertNativeDataPrototype(item, "Object", path);
+      const descriptors = Object.getOwnPropertyDescriptors(item);
+      const result: Record<string, unknown> = prototype === null ? Object.create(null) : {};
+      for (const key of Reflect.ownKeys(descriptors)) {
+        if (typeof key === "symbol") {
+          throw invalidNestedIdentity(`${path} object contains unsupported symbol properties`);
+        }
+        const descriptor = descriptors[key];
+        assertEnumerableDataDescriptor(descriptor, `${path}.${key}`);
+        result[key] = clone(descriptor.value, `${path}.${key}`);
+      }
+      return result;
+    } finally {
+      ancestors.delete(item);
+    }
+  };
+
+  return { value: clone(value, "workflow args"), carriesRetainedWorktree };
 }
 
 function assertNativeDataPrototype(item: object, expectedName: "Array" | "Object", path: string): void {

@@ -9,10 +9,12 @@ import { MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CONCURRENCY } from "./config
 import { preview, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import { WorkflowError, WorkflowErrorCode } from "./errors.js";
 import {
+  boundWorktreeCleanupFailure,
   createRunPersistence,
   createTerminalSnapshot,
   generateRunId,
   LEGACY_EXECUTION_OPTIONS,
+  mergeWorktreeCleanupFailures,
   type PersistedExecutionOptions,
   type PersistedRunState,
   type ResolvedExecutionOptions,
@@ -24,6 +26,7 @@ import {
 import { type RuntimeCheckpoint, restoreTokenUsage } from "./usage.js";
 import { type JournalEntry, parseWorkflowScript, runWorkflow, type WorkflowRunResult } from "./workflow.js";
 import { canonicalWorkflowCwd, workflowProjectKey } from "./workflow-paths.js";
+import type { WorktreeCleanupFailure, WorktreeOperations } from "./worktree.js";
 
 export interface ManagedRun {
   runId: string;
@@ -55,6 +58,8 @@ export interface ManagedRun {
   settlement?: Promise<unknown>;
   /** Durable cumulative usage, attempts, and phase-budget state. */
   runtimeCheckpoint?: RuntimeCheckpoint;
+  /** Bounded cleanup recovery diagnostics for retained worktrees. */
+  worktreeCleanupFailures?: WorktreeCleanupFailure[];
   /**
    * True when the run was started in the background (or resumed) and the caller is
    * not awaiting its result inline. Only background runs deliver their result back
@@ -136,6 +141,8 @@ export interface WorkflowRunMetadata {
   };
   journalEntries: number;
   tokenUsage?: PersistedRunState["tokenUsage"];
+  /** Bounded retained-worktree cleanup recovery diagnostics; exact paths are omitted from logs. */
+  worktreeCleanupFailures?: WorktreeCleanupFailure[];
   terminal?: {
     version: 1;
     outcome: TerminalSnapshot["outcome"];
@@ -169,6 +176,8 @@ export interface WorkflowManagerOptions {
   defaultAgentTimeoutMs?: number | null;
   /** Default retry attempts after recoverable agent failures. */
   defaultAgentRetries?: number;
+  /** Internal/injectable retained-worktree filesystem operations. */
+  worktreeOperations?: WorktreeOperations;
   /**
    * Persist each subagent transcript as a real pi session file under the
    * standard sessions directory. Default false (in-memory, discarded).
@@ -192,6 +201,7 @@ export class WorkflowManager extends EventEmitter {
   private defaultAgentTimeoutMs: number | null;
   private defaultAgentRetries: number;
   private persistAgentSessions: boolean;
+  private worktreeOperations?: WorktreeOperations;
 
   constructor(options: WorkflowManagerOptions = {}) {
     super();
@@ -205,6 +215,7 @@ export class WorkflowManager extends EventEmitter {
     this.defaultAgentTimeoutMs = options.defaultAgentTimeoutMs ?? null;
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
     this.persistAgentSessions = options.persistAgentSessions ?? false;
+    this.worktreeOperations = options.worktreeOperations;
     this.persistence = createRunPersistence(this.cwd);
     this.recoverStaleRuns();
   }
@@ -413,6 +424,7 @@ export class WorkflowManager extends EventEmitter {
     exec: ExecOptions = {},
   ): Promise<WorkflowRunResult> {
     const { resumeJournal, externalSignal, onProgress, confirm } = exec;
+    const priorCleanupFailures = managed.worktreeCleanupFailures?.map((failure) => structuredClone(failure));
     const executionOptions = managed.executionOptions ?? this.resolveExecutionOptions(exec);
     managed.executionOptions = executionOptions;
     const { maxAgents, agentTimeoutMs, tokenBudget, concurrency, agentRetries } = executionOptions;
@@ -455,6 +467,12 @@ export class WorkflowManager extends EventEmitter {
         resumeJournal,
         runtimeCheckpoint: managed.runtimeCheckpoint,
         resumeFromRunId: resumeJournal ? managed.runId : undefined,
+        worktreeOperations: this.worktreeOperations,
+        onWorktreeCleanupFailure: (failure) => {
+          if (!ownsLeaseGeneration()) return;
+          managed.worktreeCleanupFailures = mergeWorktreeCleanupFailures(managed.worktreeCleanupFailures, [failure]);
+          this.persistRun(managed);
+        },
         onAgentJournal: (entry) => {
           if (!ownsGeneration()) return;
           // Stable logical identities survive keyed physical reorders. Supersede
@@ -494,7 +512,7 @@ export class WorkflowManager extends EventEmitter {
         onLog: (message) => {
           if (!ownsGeneration()) return;
           managed.snapshot.logs.push(message);
-          this.emit("log", { runId: managed.runId, message });
+          this.emitNonMaskingObserver("log", { runId: managed.runId, message });
           progress();
         },
         onPhase: (title) => {
@@ -617,6 +635,22 @@ export class WorkflowManager extends EventEmitter {
       // The public/control-plane run ID is the persisted manager ID. Keep the
       // runtime's legacy internal run-* identifier for subagent session names.
       result.runId = managed.runId;
+      const cleanupFailures = mergeWorktreeCleanupFailures(
+        priorCleanupFailures,
+        managed.worktreeCleanupFailures,
+        result.worktreeCleanupFailures,
+      );
+      managed.worktreeCleanupFailures = cleanupFailures;
+      result.worktreeCleanupFailures = cleanupFailures;
+      if (priorCleanupFailures?.length && cleanupFailures?.length) {
+        const stages = [...new Set(cleanupFailures.map((failure) => failure.stage))].join(", ");
+        const warning = `Cleanup warning: ${cleanupFailures.length} retained worktree cleanup failure(s) at stage(s): ${stages}. Workflow computation still completed.`;
+        if (!managed.snapshot.logs.includes(warning)) {
+          managed.snapshot.logs.push(warning);
+          this.emitNonMaskingObserver("log", { runId: managed.runId, message: warning });
+          progress();
+        }
+      }
       if (!ownsGeneration()) {
         throw new WorkflowError("Workflow execution no longer owns its run lease", WorkflowErrorCode.WORKFLOW_ABORTED, {
           recoverable: true,
@@ -710,6 +744,17 @@ export class WorkflowManager extends EventEmitter {
     managed.lease = undefined;
   }
 
+  private emitNonMaskingObserver(eventName: string | symbol, ...args: unknown[]): void {
+    for (const listener of this.rawListeners(eventName)) {
+      try {
+        const callbackResult = Reflect.apply(listener, this, args) as unknown;
+        if (callbackResult !== undefined) void Promise.resolve(callbackResult).catch(() => undefined);
+      } catch {
+        // Logging observers are never allowed to replace the workflow outcome.
+      }
+    }
+  }
+
   private toPersistedState(managed: ManagedRun): PersistedRunState {
     return {
       version: 2,
@@ -755,6 +800,7 @@ export class WorkflowManager extends EventEmitter {
       updatedAt: managed.terminalAt ?? new Date().toISOString(),
       completedAt: managed.status === "completed" ? managed.terminalAt : undefined,
       durationMs: managed.result?.durationMs,
+      worktreeCleanupFailures: managed.worktreeCleanupFailures?.map((failure) => structuredClone(failure)),
       terminalSnapshot: managed.terminalSnapshot,
     };
   }
@@ -911,6 +957,7 @@ export class WorkflowManager extends EventEmitter {
       // run-start and persistRun() re-persists it on every subsequent write.
       autoResume: persisted.autoResume,
       runtimeCheckpoint,
+      worktreeCleanupFailures: persisted.worktreeCleanupFailures?.map((failure) => structuredClone(failure)),
     };
     this.runs.set(runId, managed);
     // Persist before notifying renderers: listRuns() is their source of truth for
@@ -986,7 +1033,8 @@ export class WorkflowManager extends EventEmitter {
   }
 
   /**
-   * Get status of a specific run.
+   * Get live/in-memory status for a run owned by this manager instance.
+   * Cold terminal state is available through getRunMetadata() or listRuns().
    */
   getRun(runId: string): ManagedRun | undefined {
     return this.runs.get(runId);
@@ -1088,6 +1136,9 @@ export class WorkflowManager extends EventEmitter {
             ...(run.tokenUsage.cacheWrite === undefined ? {} : { cacheWrite: run.tokenUsage.cacheWrite }),
           }
         : undefined,
+      worktreeCleanupFailures: (live?.worktreeCleanupFailures ?? run.worktreeCleanupFailures)?.map((failure) =>
+        boundWorktreeCleanupFailure(failure),
+      ),
       terminal,
     };
   }
