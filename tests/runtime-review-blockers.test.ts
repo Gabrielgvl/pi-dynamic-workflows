@@ -190,7 +190,7 @@ return await agent('slow non-cooperative work')`,
   }
 });
 
-test("manager keeps a checkpoint continuation owned before resume and final settlement", async () => {
+test("manager drains an owned checkpoint but rejects its post-settlement agent continuation", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-dw-checkpoint-resume-"));
   const checkpointStarted = deferred<void>();
   const releaseCheckpoint = deferred<void>();
@@ -260,19 +260,18 @@ return await Promise.all([
     assert.equal(settledBeforeRelease, false, "the manager run must remain unsettled while checkpoint() is pending");
     assert.equal(statusBeforeRelease, "running");
     assert.equal(resumeAllowed, false, "resume must not start another generation while checkpoint() owns a branch");
-    assert.equal(lateCalls, 1, "the checkpoint continuation launches exactly once in the owning generation");
-    assert.equal(lateSettled, true, "late work settles before the owning run rejects");
+    assert.equal(lateCalls, 0, "the terminal admission barrier rejects the post-settlement agent");
+    assert.equal(lateSettled, false, "no agent work starts after root script settlement");
   } finally {
     releaseCheckpoint.resolve();
     rmSync(cwd, { recursive: true, force: true });
   }
 });
 
-test("manager blocks deletion until checkpoint continuations finish and launch no post-cleanup work", async () => {
+test("manager blocks deletion until checkpoint settlement and rejects post-barrier work", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-dw-checkpoint-delete-"));
   const checkpointStarted = deferred<void>();
   const releaseCheckpoint = deferred<void>();
-  const lateStarted = deferred<void>();
   let lateCalls = 0;
   const manager = new WorkflowManager({
     cwd,
@@ -286,7 +285,6 @@ test("manager blocks deletion until checkpoint continuations finish and launch n
           });
         }
         lateCalls++;
-        lateStarted.resolve();
         return "late-done";
       },
     },
@@ -319,13 +317,12 @@ return await Promise.all([
     const deleteBeforeRelease = manager.deleteRun(runId);
 
     releaseCheckpoint.resolve();
-    await lateStarted.promise;
     await assert.rejects(promise, /hard failure/);
     const callsAtSettlement = lateCalls;
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     assert.equal(deleteBeforeRelease, false, "delete must remain blocked while checkpoint() owns a branch");
-    assert.equal(callsAtSettlement, 1);
+    assert.equal(callsAtSettlement, 0, "the post-checkpoint agent is rejected by terminal admission");
     assert.equal(lateCalls, callsAtSettlement, "no work may launch after settlement and store cleanup");
     assert.equal(manager.deleteRun(runId), true, "delete succeeds after the complete child lifetime settles");
   } finally {

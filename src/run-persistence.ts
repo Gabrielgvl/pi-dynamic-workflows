@@ -11,9 +11,59 @@ import type { WorkflowErrorCode } from "./errors.js";
 import type { RuntimeCheckpoint, TokenUsage } from "./usage.js";
 import type { JournalEntry } from "./workflow.js";
 import { canonicalWorkflowCwd, workflowProjectKey, workflowProjectPaths } from "./workflow-paths.js";
+import {
+  sanitizeRetainedWorktreeCapabilitiesForPersistence,
+  sanitizeWorktreeCleanupFailure,
+  type WorktreeCleanupFailure,
+} from "./worktree.js";
 
 export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
 export type TerminalRunStatus = Extract<RunStatus, "completed" | "failed" | "aborted">;
+
+export const MAX_WORKTREE_CLEANUP_FAILURES = 20;
+export const MAX_WORKTREE_CLEANUP_MESSAGE_CHARS = 1024;
+
+/** Bound and redact durable/public cleanup diagnostics while preserving opaque recovery identity. */
+export function boundWorktreeCleanupFailure(failure: WorktreeCleanupFailure): WorktreeCleanupFailure {
+  return sanitizeWorktreeCleanupFailure(failure);
+}
+
+export function mergeWorktreeCleanupFailures(
+  ...groups: ReadonlyArray<readonly WorktreeCleanupFailure[] | undefined>
+): WorktreeCleanupFailure[] | undefined {
+  const merged: WorktreeCleanupFailure[] = [];
+  const seen = new Set<string>();
+  for (const group of groups) {
+    for (const failure of group ?? []) {
+      const bounded = boundWorktreeCleanupFailure(failure);
+      const key = JSON.stringify([
+        bounded.stage,
+        bounded.message,
+        bounded.identity.recoveryId,
+        bounded.identity.branchRef,
+        bounded.identity.baseSha,
+      ]);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(bounded);
+      if (merged.length === MAX_WORKTREE_CLEANUP_FAILURES) return merged;
+    }
+  }
+  return merged.length > 0 ? merged : undefined;
+}
+
+export function boundedWorktreeCleanupFailures(
+  failures: readonly WorktreeCleanupFailure[] | undefined,
+): WorktreeCleanupFailure[] | undefined {
+  return mergeWorktreeCleanupFailures(failures);
+}
+
+export function worktreeCleanupWarning(failures: readonly WorktreeCleanupFailure[] | undefined): string | undefined {
+  const bounded = boundedWorktreeCleanupFailures(failures);
+  if (!bounded) return undefined;
+  const stages = [...new Set(bounded.map((failure) => failure.stage))].join(", ");
+  return `Cleanup warning: ${bounded.length} retained worktree cleanup failure(s) at stage(s): ${stages}. Workflow computation still completed.`;
+}
 
 export interface PersistedExecutionOptions {
   maxAgents: number;
@@ -140,6 +190,8 @@ export interface PersistedRunState {
   autoResume?: boolean;
   /** Auto-resume attempt counter for the current usage_limit pause-cycle. */
   autoResumeAttempts?: number;
+  /** Bounded retained-worktree cleanup recovery diagnostics; never contains a handle. */
+  worktreeCleanupFailures?: WorktreeCleanupFailure[];
   /** Bounded deterministic terminal evidence. Paused runs never carry this field. */
   terminalSnapshot?: TerminalSnapshot;
 }
@@ -220,7 +272,8 @@ export function createTerminalSnapshot(
   if (state.status !== "completed" && state.status !== "failed" && state.status !== "aborted") return undefined;
 
   const result = options.result !== undefined ? options.result : state.result;
-  const resultEvidence = result === undefined ? undefined : boundedTerminalEvidence(result);
+  const sanitizedResult = sanitizeRetainedWorktreeCapabilitiesForPersistence(result);
+  const resultEvidence = result === undefined ? undefined : boundedTerminalEvidence(sanitizedResult);
   const error = options.error
     ? {
         code: options.error.code,
@@ -548,6 +601,37 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
         : { scopeUsage: structuredClone(scopeUsage) as RuntimeCheckpoint["scopeUsage"] }),
     };
   };
+  const normalizeWorktreeCleanupFailures = (value: unknown): WorktreeCleanupFailure[] | undefined => {
+    if (value === undefined) return undefined;
+    if (!Array.isArray(value) || value.length > MAX_WORKTREE_CLEANUP_FAILURES) {
+      throw new Error("Invalid worktreeCleanupFailures");
+    }
+    return value.map((item, index) => {
+      const prefix = `worktreeCleanupFailures[${index}]`;
+      const failure = record(item, prefix);
+      if (
+        !(
+          ["identity_verification", "worktree_remove", "branch_delete", "cleanup_dispatch", "unknown"] as unknown[]
+        ).includes(failure.stage)
+      ) {
+        throw new Error(`Invalid ${prefix}.stage`);
+      }
+      const identity = record(failure.identity, `${prefix}.identity`);
+      const optionalIdentityString = (key: "recoveryId" | "repoRoot" | "worktreePath", max: number) =>
+        identity[key] === undefined ? undefined : string(identity[key], `${prefix}.identity.${key}`, max);
+      return boundWorktreeCleanupFailure({
+        stage: failure.stage as WorktreeCleanupFailure["stage"],
+        message: string(failure.message, `${prefix}.message`, MAX_WORKTREE_CLEANUP_MESSAGE_CHARS),
+        identity: {
+          recoveryId: optionalIdentityString("recoveryId", 128),
+          repoRoot: optionalIdentityString("repoRoot", 4096),
+          worktreePath: optionalIdentityString("worktreePath", 4096),
+          branchRef: string(identity.branchRef, `${prefix}.identity.branchRef`, 1024),
+          baseSha: string(identity.baseSha, `${prefix}.identity.baseSha`, 128),
+        },
+      });
+    });
+  };
   const normalizeTerminalSnapshot = (value: unknown): TerminalSnapshot | undefined => {
     if (value === undefined) return undefined;
     const snapshot = record(value, "terminalSnapshot");
@@ -642,6 +726,7 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
               throw new Error("Invalid autoResume");
             })(),
       autoResumeAttempts: optionalNumber(state.autoResumeAttempts, "autoResumeAttempts", true),
+      worktreeCleanupFailures: normalizeWorktreeCleanupFailures(state.worktreeCleanupFailures),
       terminalSnapshot:
         state.status === "completed" || state.status === "failed" || state.status === "aborted"
           ? normalizeTerminalSnapshot(state.terminalSnapshot)
@@ -693,7 +778,8 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
       assertSafeRunId(state.runId);
       ensureDir();
       const savedAt = new Date().toISOString();
-      const normalized = normalizeState(state);
+      const persistenceSafeState = sanitizeRetainedWorktreeCapabilitiesForPersistence(state);
+      const normalized = normalizeState(persistenceSafeState);
       state.updatedAt = savedAt;
       normalized.updatedAt = savedAt;
       state.terminalSnapshot ??= normalized.terminalSnapshot;

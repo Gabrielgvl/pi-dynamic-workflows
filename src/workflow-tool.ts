@@ -16,7 +16,7 @@ import {
   type WorkflowSnapshot,
 } from "./display.js";
 import { WorkflowError, WorkflowErrorCode } from "./errors.js";
-import { isSafeRunId } from "./run-persistence.js";
+import { boundedWorktreeCleanupFailures, isSafeRunId, worktreeCleanupWarning } from "./run-persistence.js";
 import { parseWorkflowScript, type WorkflowRunResult } from "./workflow.js";
 import { WorkflowManager, WorkflowManagerRegistry } from "./workflow-manager.js";
 import { canonicalWorkflowCwd } from "./workflow-paths.js";
@@ -221,7 +221,8 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         "For workflow runs, pass exactly one of inline `script` or host-file `scriptPath`. Relative scriptPath resolves from canonical cwd, is freshly read, follows final symlinks to regular files, and is limited to 1 MiB.",
         "For workflow, the script's first statement must be `export const meta = { name: 'short_snake_case', description: 'non-empty human description', phases: [{ title: 'Phase name' }] }`; meta.name and meta.description are required non-empty strings.",
         "For workflow, write plain JavaScript after the meta export. Do not use TypeScript syntax, imports, require(), fs, Date.now(), Math.random(), or new Date().",
-        "For workflow, available globals are agent(prompt, opts), parallel(thunks), pipeline(items, ...stages), workflow(nameOrScript, args?, { key?: string }), phase(title), log(message), args, cwd, process.cwd(), and budget. Every workflow must call agent() at least once; do not use workflow only to declare phases or return a static object.",
+        "For workflow, available globals are agent(prompt, opts), releaseWorktree(handle), parallel(thunks), pipeline(items, ...stages), workflow(nameOrScript, args?, { key?: string }), phase(title), log(message), args, cwd, process.cwd(), and budget. Every workflow must call agent() at least once; do not use workflow only to declare phases or return a static object.",
+        "For workflow, retained handoff uses agent(..., { isolation: 'worktree', retainWorktree: true }), which returns `{ result, worktree }`; pass only the opaque handle as `{ worktree: handle }` to consumers. Calling `releaseWorktree(handle)` is mandatory and idempotent; the root execution-context owner performs terminal fallback cleanup. Never expose or reconstruct checkout paths.",
         "For workflow, prefer the built-in quality helpers when they fit (each is built on agent()/parallel() and returns plain data): verify(item, {reviewers, threshold, lens}) for adversarial fact-checking; judgePanel(attempts, {judges, rubric}) to score N candidates and return the best; loopUntilDry({round, key, consecutiveEmpty}) to keep finding until rounds stop yielding new items; completenessCheck(args, results) as a final 'what's missing' critic.",
         "For workflow, when meta.phases declares more than one phase, call phase('Exact Title') at the start of each phase's work (or set opts.phase on each agent) so every agent groups under the correct phase; never declare a phase you don't switch into — a declared phase with no agents shows as 0/0 and any agent you forgot to move stays in the previous phase.",
         "For workflow, do not set tokenBudget or agentTimeoutMs unless the user explicitly asks to cap spend or time; the defaults are unbounded.",
@@ -414,12 +415,15 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
 
       const formattedResult =
         result.result !== undefined ? `\n\`\`\`json\n${JSON.stringify(result.result, null, 2)}\n\`\`\`` : "";
+      const cleanupFailures = boundedWorktreeCleanupFailures(result.worktreeCleanupFailures);
+      const cleanupWarning = worktreeCleanupWarning(cleanupFailures);
+      const cleanupInfo = cleanupWarning ? `\n\n> **Warning:** ${cleanupWarning}` : "";
 
       return {
         content: [
           {
             type: "text",
-            text: `Workflow **${result.meta.name}** completed with **${result.agentCount}** agent(s).${tokenInfo}\n\n## Result${formattedResult}\n\n${reviseHint(result.runId)}`,
+            text: `Workflow **${result.meta.name}** completed with **${result.agentCount}** agent(s).${cleanupInfo}${tokenInfo}\n\n## Result${formattedResult}\n\n${reviseHint(result.runId)}`,
           },
         ],
         details: {
@@ -430,6 +434,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           result: result.result,
           durationMs: result.durationMs,
           tokenUsage: result.tokenUsage,
+          worktreeCleanupFailures: cleanupFailures,
           action: "run",
           cwd: selectedCwd,
           runId: result.runId,

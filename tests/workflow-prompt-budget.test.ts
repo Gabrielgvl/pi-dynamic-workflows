@@ -17,7 +17,7 @@ import { withFakeHomeAsync } from "./helpers/fake-home.js";
 // Ratcheted for the additive run/status/resume/stop controls plus the existing
 // resumeFromRunId edited-script surface. The always-on rendered prompt remains
 // unchanged; control discoverability comes from the tool definition.
-const RENDERED_PROMPT_BUDGET_BYTES = 6_520;
+const RENDERED_PROMPT_BUDGET_BYTES = 6_833;
 const TOOL_DEFINITION_BUDGET_BYTES = 3_000;
 
 test("rendered workflow prompt contribution stays within its accepted size", async () => {

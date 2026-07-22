@@ -28,6 +28,7 @@ import {
   readWorkflowScriptPath,
   WORKFLOW_SCRIPT_MAX_BYTES,
 } from "../src/workflow-tool.js";
+import type { Worktree, WorktreeCleanupFailure } from "../src/worktree.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 /** Minimal fake ModelRegistry, matching the shape the PR's existing tests use. */
@@ -91,6 +92,19 @@ test("createWorkflowTool has promptGuidelines array", () => {
   const tool = createWorkflowTool();
   assert.ok(Array.isArray(tool.promptGuidelines), "tool.promptGuidelines should be an array");
   assert.ok(tool.promptGuidelines.length > 5, "should have several guidelines");
+});
+
+test("createWorkflowTool documents the complete retained-worktree authoring contract", () => {
+  const all = createWorkflowTool().promptGuidelines.join(" ");
+
+  assert.match(all, /retainWorktree:\s*true/);
+  assert.match(all, /\{\s*result\s*,\s*worktree\s*\}/);
+  assert.match(all, /worktree:\s*handle/);
+  assert.match(all, /releaseWorktree\(handle\)/);
+  assert.match(all, /mandatory/i);
+  assert.match(all, /idempotent/i);
+  assert.match(all, /root.*terminal.*cleanup/i);
+  assert.match(all, /opaque|do not.*path|avoid.*path/i);
 });
 
 test("createWorkflowTool routes normal work through tiers and reserves exact models for user requests", () => {
@@ -312,6 +326,111 @@ test("createWorkflowTool canonicalizes an explicit cwd during argument preparati
     rmSync(cwd, { recursive: true, force: true });
   }
 });
+
+test(
+  "foreground workflow completion warns about bounded path-free cleanup failures without masking success",
+  withToolTempCwd(async (cwd) => {
+    const posixSecret = join(cwd, "foreground-private-fragment", "checkout");
+    const windowsSecret = "C:\\Users\\foreground-private-fragment\\checkout";
+    const hostileLabel = `${posixSecret}\ncontrol\u0001 ${windowsSecret} api-key=tool-label-secret`;
+    const worktree: Worktree = {
+      isolated: true,
+      cwd: posixSecret,
+      repoRoot: cwd,
+      branch: "pi/wf/foreground-warning",
+      branchRef: "refs/heads/pi/wf/foreground-warning",
+      baseSha: "a".repeat(40),
+    };
+    const manager = new WorkflowManager({
+      cwd,
+      agent: toolFakeAgent("computed result"),
+      worktreeOperations: {
+        async createWorktree() {
+          return worktree;
+        },
+        async removeWorktree(): Promise<WorktreeCleanupFailure[]> {
+          return [
+            {
+              stage: "worktree_remove",
+              message: `cannot remove ${posixSecret} or ${windowsSecret}`,
+              identity: {
+                repoRoot: cwd,
+                worktreePath: posixSecret,
+                branchRef: worktree.branchRef ?? "",
+                baseSha: worktree.baseSha ?? "",
+              },
+            },
+          ];
+        },
+      },
+    });
+    const tool = createWorkflowTool({ cwd, manager });
+    const result = await tool.execute(
+      "foreground-cleanup-warning",
+      {
+        script: `export const meta = { name: 'foreground_warning', description: 'cleanup warning' }
+await agent('producer', { label: ${JSON.stringify(hostileLabel)}, isolation: 'worktree' })
+return 'computed result'`,
+        background: false,
+      },
+      undefined,
+      () => {},
+      {},
+    );
+    const text = result.content?.[0]?.type === "text" ? result.content[0].text : "";
+    const failures = result.details.worktreeCleanupFailures as WorktreeCleanupFailure[];
+    assert.equal(result.details.result, "computed result");
+    assert.ok(failures.length > 0);
+    assert.match(text, /warning/i);
+    assert.match(text, /worktree_remove/);
+    assert.match(text, new RegExp(`${failures.length}.*cleanup`, "i"));
+    const publicSurface = JSON.stringify({ text, failures, logs: result.details.logs });
+    for (const secret of [
+      posixSecret,
+      windowsSecret,
+      "foreground-private-fragment",
+      "Users",
+      "control",
+      "api-key",
+      "tool-label-secret",
+    ]) {
+      assert.equal(publicSurface.includes(secret), false, `foreground cleanup tool details omit ${secret}`);
+    }
+
+    const cleanManager = new WorkflowManager({
+      cwd,
+      agent: toolFakeAgent("clean result"),
+      worktreeOperations: {
+        async createWorktree() {
+          return {
+            ...worktree,
+            cwd: join(cwd, "clean-checkout"),
+            branch: "pi/wf/clean",
+            branchRef: "refs/heads/pi/wf/clean",
+          };
+        },
+        async removeWorktree() {
+          return [];
+        },
+      },
+    });
+    const clean = await createWorkflowTool({ cwd, manager: cleanManager }).execute(
+      "foreground-clean-control",
+      {
+        script: `export const meta = { name: 'foreground_clean', description: 'clean completion' }
+await agent('producer', { isolation: 'worktree', retainWorktree: true })
+return 'clean result'`,
+        background: false,
+      },
+      undefined,
+      () => {},
+      {},
+    );
+    const cleanText = clean.content?.[0]?.type === "text" ? clean.content[0].text : "";
+    assert.doesNotMatch(cleanText, /cleanup warning/i);
+    assert.equal(clean.details.worktreeCleanupFailures, undefined);
+  }),
+);
 
 test("createWorkflowTool routes run/status/resume/stop through the canonical cwd manager", async () => {
   const first = mkdtempSync(join(tmpdir(), "pi-dw-tool-first-"));
